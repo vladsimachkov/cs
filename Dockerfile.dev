@@ -1,7 +1,9 @@
 # Development / CI image for ColdStore.
 # Everything the toolchain needs lives in this image; nothing is installed on the host.
 #
-#   docker build -f Dockerfile.dev -t coldstore-dev .
+#   docker build -f Dockerfile.dev --build-arg RUST_VERSION=<channel from rust-toolchain.toml> \
+#       -t coldstore-dev .
+#       (scripts/docker.sh does this for you — see the note on RUST_VERSION below)
 #   docker run --rm \
 #       -v <repo>:/work \
 #       -v coldstore-cargo-registry:/usr/local/cargo/registry \
@@ -13,10 +15,25 @@
 # /usr/local/cargo — the rustup shims for cargo/rustc live in /usr/local/cargo/bin.
 #
 # See scripts/docker.sh for ready-made wrappers.
-# RUST_VERSION keeps the container pinned while GitHub Actions (if ever re-enabled)
-# would otherwise float to whatever `stable` is. See docs/BUILD.md §2.1.
-ARG RUST_VERSION=1.91
+# RUST_VERSION is the exact patch version. scripts/docker.sh passes the `channel` from
+# rust-toolchain.toml as this ARG, so the repo pin drives the image tag; the RUN below then fails
+# the build if the image built from that tag is not exactly that version. Pinning the patch (not
+# `1.91`) is deliberate: the `rust:1.91` tag is re-published when a patch lands, and a toolchain
+# that floats under the repo pin is how a clippy-only upgrade produced 109 lint errors here once
+# before. See docs/BUILD.md §2.1.
+# No default on purpose: a manual `docker build -f Dockerfile.dev` without --build-arg must fail
+# here rather than build an image that lags rust-toolchain.toml while its own self-check passes
+# (the check compares the image against this same ARG, and the empty build context means the file
+# cannot be read at build time). scripts/docker.sh always passes the pin.
+ARG RUST_VERSION
 FROM rust:${RUST_VERSION}
+
+# An ARG declared before FROM is only visible in the FROM line itself; redeclare it to use it here.
+ARG RUST_VERSION
+# The build context is deliberately empty (.dockerignore), so nothing from the repo can be COPYed
+# here; the pin arrives as a build arg and this only verifies the image really is that version.
+RUN set -eux; \
+    rustc --version | grep -q "^rustc ${RUST_VERSION} "
 
 # protobuf-compiler -> tonic-build; libprotobuf-dev ships /usr/include/google/protobuf/*.proto,
 # which prost needs to resolve `google/protobuf/timestamp.proto` (protobuf-compiler alone does not
@@ -33,5 +50,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 RUN rustup component add rustfmt clippy
+
+# Fail the build here rather than at the first `scripts/docker.sh fmt` on someone's machine.
+RUN set -eux; \
+    cargo fmt --version >/dev/null; \
+    cargo clippy --version >/dev/null
 
 WORKDIR /work

@@ -1,0 +1,19 @@
+# The toolchain this repository is built and linted with. This is the source of truth.
+#
+# A bump means editing two places:
+#   1. `channel` below — `scripts/docker.sh` reads it and passes it to the image build, so the
+#      container follows automatically (Dockerfile.dev has no default ARG precisely so a manual
+#      build cannot quietly lag this file);
+#   2. the version hard-coded twice in .github/workflows/rust.yml — `uses: dtolnay/rust-toolchain@…`
+#      and the `RUSTUP_TOOLCHAIN` of the drift-check step. That step compares the forced toolchain
+#      against this file, so it fails (rather than silently passing) when the two disagree.
+#
+# Pin the full patch version. `1.91` would let rustup resolve a different 1.91.x on every
+# machine, and the `rust:1.91` image tag is re-published when a patch lands — which is exactly
+# how a clippy-only toolchain upgrade produced 109 lint errors here once before.
+#
+# After a bump: `scripts/docker.sh clippy`, `scripts/docker.sh test`, then regenerate and
+# commit Cargo.lock (it is committed on purpose; see AGENTS.md §3.1).
+[toolchain]
+channel = "1.91.1"
+components = ["rustfmt", "clippy"]

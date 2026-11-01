@@ -3,6 +3,7 @@ name = "coldstore-common"
 description = "ColdStore shared types, models, and error handling"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

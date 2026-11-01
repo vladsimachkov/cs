@@ -43,9 +43,10 @@ fi
 # also treated as a code change.
 is_code_path() {
     case "$1" in
-        # Cargo.lock is git-ignored today (§3.1); this branch only fires on `git add -f`,
-        # and is kept as a safety net for when PL-06a commits the lock file.
-        crates/*|Cargo.toml|Cargo.lock|Makefile|Dockerfile*|scripts/*|configs/*|.github/*|.gitignore)
+        # Cargo.lock is committed (AGENTS.md §3.1) and a lock change is a dependency change,
+        # so it always needs a review. rust-toolchain.toml is listed for clarity: an unlisted
+        # non-*.md path already counts as code through the catch-all below.
+        crates/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|Makefile|Dockerfile*|scripts/*|configs/*|.github/*|.gitignore)
             return 0 ;;
         *.md)
             # Documentation that defines how the code is built and reviewed is not exempt.

@@ -15,6 +15,14 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# Declared MSRV: the oldest toolchain that must build the workspace. It is not the same thing as
+# rust-toolchain.toml, which pins the one toolchain we actually build and lint with (1.91.1).
+# Nothing in check-safe or CI compiles at the MSRV; what enforces it is cargo's own rust-version
+# error whenever a toolchain older than 1.91 tries to build this workspace. Separately, no package
+# in the committed lock *declares* a rust-version above 1.91 — that is a declaration check over
+# every lock entry (`cargo metadata --format-version 1`, field `packages[].rust_version`), not a
+# compile check over platform-specific crates. Raise only with a reason.
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yourusername/coldstore"
 

@@ -19,10 +19,26 @@ jobs:
     - name: Install system dependencies
       run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev clang libclang-dev llvm-dev
 
+    # rust-toolchain.toml is the source of truth for the toolchain. This pin must match it, and
+    # the guard step below fails the job if the two ever drift apart (a floating `stable` here is
+    # what produced 109 clippy errors when stable moved to 1.99).
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.91.1
       with:
         components: rustfmt, clippy
+
+    # `rustc --version --format` is an unstable flag, so parse the plain output. RUSTUP_TOOLCHAIN is
+    # set explicitly: without it `rustc` would read rust-toolchain.toml, i.e. the same file the
+    # comparison reads, and the check would be tautologically true.
+    - name: Check the toolchain matches rust-toolchain.toml
+      env:
+        RUSTUP_TOOLCHAIN: 1.91.1
+      run: test "$(rustc --version | awk '{print $2}')" = "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+
+    # Cargo.lock is committed (AGENTS.md §3.1); --locked turns "someone forgot to update the lock
+    # file" into a red build instead of a silently different dependency set.
+    - name: Check Cargo.lock is up to date
+      run: cargo metadata --locked --format-version 1 > /dev/null
 
     - name: Cache cargo
       uses: actions/cache@v4
@@ -40,7 +56,7 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: cargo clippy
-      run: cargo clippy --workspace --all-targets -- -D warnings
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
     - name: cargo build
       run: cargo build --workspace --verbose

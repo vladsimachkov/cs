@@ -3,6 +3,7 @@ name = "coldstore-cache"
 description = "ColdStore cache worker (independent binary, SPDK/HDD backend)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

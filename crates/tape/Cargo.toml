@@ -3,6 +3,7 @@ name = "coldstore-tape"
 description = "ColdStore tape worker (SCSI tape drive management)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

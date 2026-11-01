@@ -3,6 +3,7 @@ name = "coldstore-metadata"
 description = "ColdStore metadata cluster node (Raft + RocksDB)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
@@ -32,5 +33,9 @@ config = { workspace = true }
 
 # Default metadata execution path is now persistent Raft-local mode.
 # Disable default features only when explicitly embedding with a custom runtime.
-openraft = { version = "0.10.0-alpha.18", optional = true }
+# Pinned exactly, not to a range. `"0.10.0-alpha.18"` was a floating caret requirement: cargo's
+# prerelease rule (`>=0.10.0-alpha.18, <0.11.0`) silently admitted newer alphas, so a fresh resolve
+# moved us to alpha.37 with no manifest diff to review. The roadmap risk table asks for exactly this
+# (`Pin exactly (=)`) until MD-07 evaluates a stable openraft.
+openraft = { version = "=0.10.0-alpha.37", optional = true }
 rocksdb = { version = "0.24", default-features = false, optional = true }

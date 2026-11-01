@@ -28,8 +28,11 @@ tape-backed cold archive with restore, cache, offline-tape workflows, data prote
 
 ## Milestones
 
-Each milestone has a hard exit criterion. A milestone is **done only when its exit test runs in CI**
-(or in the mhVTL lab job, for M2).
+Each milestone has a hard exit criterion. A milestone is **done only when its exit test runs
+automatically** — in CI, or, while GitHub Actions are disabled in this repository (per the maintainer,
+2026-11: no quota), in the
+container gate (`scripts/docker.sh check-safe`). The mhVTL lab job applies for M2 either way. A test
+that only someone remembers to run does not close a milestone.
 
 ### M0: Trustworthy single node (≈ 6–8 engineer-weeks)
 

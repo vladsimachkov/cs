@@ -18,8 +18,17 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 0
 fi
 
-# 1. cargo fmt -- check
-echo -e "${YELLOW}[1/4]${NC} cargo fmt --check"
+# 1. Cargo.lock vs manifests (the lock is committed; AGENTS.md §3.1)
+echo -e "${YELLOW}[1/5]${NC} cargo metadata --locked"
+if ! cargo metadata --locked --format-version 1 >/dev/null 2>&1; then
+    echo -e "${RED}✗ Cargo.lock does not match the manifests. Run 'cargo update -p <crate>' and commit it.${NC}"
+    failed=1
+else
+    echo -e "${GREEN}✓ Cargo.lock${NC}"
+fi
+
+# 2. cargo fmt -- check
+echo -e "${YELLOW}[2/5]${NC} cargo fmt --check"
 if ! cargo fmt --all -- --check 2>/dev/null; then
     echo -e "${RED}✗ cargo fmt failed. Run 'cargo fmt --all' to fix.${NC}"
     failed=1
@@ -27,17 +36,17 @@ else
     echo -e "${GREEN}✓ cargo fmt${NC}"
 fi
 
-# 2. cargo clippy
-echo -e "${YELLOW}[2/4]${NC} cargo clippy"
-if ! cargo clippy --workspace --all-targets -- -D warnings 2>/dev/null; then
+# 3. cargo clippy (same flags as CI and the Makefile)
+echo -e "${YELLOW}[3/5]${NC} cargo clippy"
+if ! cargo clippy --workspace --all-targets --all-features -- -D warnings 2>/dev/null; then
     echo -e "${RED}✗ cargo clippy found warnings/errors.${NC}"
     failed=1
 else
     echo -e "${GREEN}✓ cargo clippy${NC}"
 fi
 
-# 3. cargo check
-echo -e "${YELLOW}[3/4]${NC} cargo check"
+# 4. cargo check
+echo -e "${YELLOW}[4/5]${NC} cargo check"
 if ! cargo check --workspace 2>/dev/null; then
     echo -e "${RED}✗ cargo check failed.${NC}"
     failed=1
@@ -45,8 +54,8 @@ else
     echo -e "${GREEN}✓ cargo check${NC}"
 fi
 
-# 4. cargo test
-echo -e "${YELLOW}[4/4]${NC} cargo test"
+# 5. cargo test
+echo -e "${YELLOW}[5/5]${NC} cargo test"
 if ! cargo test --workspace --no-fail-fast 2>/dev/null; then
     echo -e "${RED}✗ cargo test failed.${NC}"
     failed=1

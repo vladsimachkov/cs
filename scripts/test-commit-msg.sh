@@ -134,6 +134,7 @@ t "docs/BUILD.ru.md counts as code" REJECT "doc: build" docs/BUILD.ru.md
 t "path with spaces is still code" REJECT "feat: sp" "crates/with space.rs"
 t "non-ASCII documentation path is exempt" ACCEPT "doc: readme" "docs/README_日本語.md"
 t "unlisted non-md path counts as code" REJECT "chore: notes" NOTES.txt
+t "rust-toolchain.toml is code (also covered by the catch-all)" REJECT "chore: bump the toolchain pin" rust-toolchain.toml
 t "doc path containing a quote is exempt" ACCEPT "doc: q" 'docs/notes".md'
 
 echo

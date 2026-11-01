@@ -46,7 +46,9 @@ ColdStore 是**纯冷归档系统**（类似 AWS Glacier Deep Archive）：
 
 ## 快速开始
 
-前置条件: Rust 1.75+, protobuf-compiler
+前置条件: Rust 1.91.1（由 `rust-toolchain.toml` 固定）、protobuf-compiler
+
+在容器内构建（不需要在主机安装 Rust）: `scripts/docker.sh build`，详见 `docs/BUILD.md`。
 
     make build-debug
 

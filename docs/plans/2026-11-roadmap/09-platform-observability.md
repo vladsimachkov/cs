@@ -11,9 +11,9 @@ Design reference: `docs/modules/08-observability.md`.
 |---|---|
 | Configuration | Standalone binaries use `Config::default()` (`TODO` in `metadata/src/main.rs`). Only `coldstore-node` reads YAML, with hardcoded ports. Many config fields are never read (`AGENTS.md` §8 #9) |
 | Telemetry | `tracing` logs only. No metrics, OTEL, health endpoints, or graceful shutdown |
-| CI | GitHub Actions runs fmt, clippy, build and test on `ubuntu-latest`. No e2e, no mhVTL, no benchmarks |
-| Reproducibility | `Cargo.lock` is git-ignored, so builds are not reproducible |
-| README claims | "Rust 1.75+" is outdated (built and verified on 1.91) |
+| CI | GitHub Actions is **disabled in this repository** (per the maintainer, 2026-11: no quota), so the gate is the container: `scripts/docker.sh check-safe`. The workflow file still exists and runs fmt, clippy, `cargo metadata --locked`, build, test and `scripts/test-commit-msg.sh`. No e2e, no mhVTL, no benchmarks |
+| Reproducibility | Fixed by PL-06a: `Cargo.lock` is committed and the toolchain is pinned in `rust-toolchain.toml` (1.91.1) with `rust-version = "1.91"` as the MSRV |
+| README claims | Fixed by PL-06a: `README_RUST.md` / `README_RUST.ru.md` now state the pinned toolchain |
 | Packaging and security | No packaging (Docker, systemd). No TLS anywhere. Gateway has no auth (GW-04) |
 
 ---
@@ -145,15 +145,19 @@ invariants hold).
 ### PL-06: CI/CD hardening `[M0 a, M1+ b]` est. 2 d + 5 d
 
 **(a) M0:**
-- **Commit `Cargo.lock`** (binaries project; reproducible CI). Remove it from `.gitignore`. Update
-  `AGENTS.md` §3.1 accordingly.
-- Pin the toolchain with `rust-toolchain.toml` (current stable, e.g. 1.91) and set `rust-version` in
-  the workspace. Fix the README claim.
-- **E2E job:** build `coldstore-node`, then run `scripts/e2e/m0.sh` (curl + aws-cli + boto3 in a
-  container) with the file-backed tape backend.
-- Run unit tests with `cargo nextest` (faster, better isolation); cache RocksDB builds (`sccache`).
-- The Makefile and the pre-commit hook mirror CI exactly. Today the Makefile uses `--all-features` in
-  clippy while CI does not; pick one.
+- [x] **Commit `Cargo.lock`** (binaries project; reproducible CI). Removed from `.gitignore`,
+  `AGENTS.md` §3.1 and §2.6 updated, CI checks `cargo metadata --locked`.
+- [x] Pin the toolchain with `rust-toolchain.toml` (1.91.1) and set `rust-version` in the workspace
+  (MSRV 1.91). README claims fixed in `README_RUST.md` / `README_RUST.ru.md`. `scripts/docker.sh`
+  drives the image tag from the pin; the workflow pins the same version with a drift check.
+- [x] The Makefile and CI lint the same way: both run
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+- [ ] **E2E job:** build `coldstore-node`, then run `scripts/e2e/m0.sh` (curl + aws-cli + boto3 in a
+  container) with the file-backed tape backend. Blocked on TP-01 (file-backed simulator) — the
+  script cannot assert durability before it exists.
+- [ ] Run unit tests with `cargo nextest` (faster, better isolation); cache RocksDB builds (`sccache`).
+  Note: the container is the gate while GitHub Actions are disabled, so "in CI" below means
+  `scripts/docker.sh check-safe`.
 
 **(b) M1+:**
 - Coverage (`cargo llvm-cov`) reported on PRs; no hard gate, but trend tracking.

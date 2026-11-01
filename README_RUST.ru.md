@@ -46,7 +46,9 @@ ColdStore — это **система чистого холодного архи
 
 ## Быстрый старт
 
-Необходимые условия: Rust 1.75+, protobuf-compiler
+Необходимые условия: Rust 1.91.1 (закреплён в `rust-toolchain.toml`), protobuf-compiler
+
+Сборка в контейнере (Rust на хосте не нужен): `scripts/docker.sh build`, подробности в `docs/BUILD.md`.
 
     make build-debug
 

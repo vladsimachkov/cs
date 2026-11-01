@@ -3,6 +3,7 @@ name = "coldstore-vtl"
 description = "ColdStore virtual tape library harness and mhVTL command wrappers"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

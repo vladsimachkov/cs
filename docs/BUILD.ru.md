@@ -24,17 +24,32 @@
 
 ### 2.1 Rust
 
-- Стабильный тулчейн. Проверено на **1.91**; «1.75+» в `README_RUST.md` устарело — текущие версии
-  зависимостей требуют более свежего компилятора. Edition 2021, файла `rust-toolchain` нет.
-- Компоненты: `rustfmt`, `clippy`.
-- Образ фиксирует тулчейн (`ARG RUST_VERSION`, по умолчанию 1.91). Чтобы проверить workspace на
-  более свежем stable до того, как на него перейдёт CI:
+- Тулчейн **зафиксирован в `rust-toolchain.toml`** (сейчас `1.91.1`), и этот файл — единственный
+  источник истины. `scripts/docker.sh` читает из него `channel` и передаёт его как `--build-arg
+  RUST_VERSION` при сборке образа; `.github/workflows/rust.yml` фиксирует ту же версию и содержит
+  шаг, который падает, если они разойдутся. Компоненты `rustfmt` и `clippy` запрошены там же и
+  проверяются при сборке образа.
+- В `Cargo.toml` также объявлено `rust-version = "1.91"`. Это **MSRV** — самый старый тулчейн,
+  которым всё ещё нужно уметь собирать, — а не тот, которым мы собираем. Поднимайте его только с
+  обоснованием в PR.
+- **`Cargo.lock` закоммичен.** Это workspace из бинарников, поэтому CI и каждый dev-контейнер
+  должны разрешать один и тот же граф (openraft закреплён точно, `=0.10.0-alpha.37`). После
+  изменения зависимостей обновляйте lock минимально — `scripts/docker.sh run cargo update -p <crate>
+  [--precise <версия>]` либо просто сборкой — и кладите его в тот же PR. `cargo generate-lockfile`
+  игнорирует существующий lock и переразрешает все пакеты заново; он для намеренного полного
+  обновления. CI выполняет `cargo metadata --locked`, так что устаревший lock валит сборку.
+- **`rust-toolchain.toml` перекрывает тег образа.** Контейнер, собранный с другим `RUST_VERSION`,
+  молча доустановит и использует зафиксированный тулчейн (проверено: образ `1.99` скачал 1.91.1 и
+  о нём же сообщил). Чтобы действительно проверить другую версию, задавайте `RUSTUP_TOOLCHAIN`;
+  чтобы вместо этого получить громкую ошибку — `RUSTUP_AUTO_INSTALL=0`.
 
   ```bash
-  docker build -f Dockerfile.dev --build-arg RUST_VERSION=1.99 -t coldstore-dev:1.99 .
-  docker run --rm -v "$PWD:/work" -v coldstore-cargo-registry:/usr/local/cargo/registry \
-      -v coldstore-cargo-git:/usr/local/cargo/git -v coldstore-target-199:/work/target \
-      coldstore-dev:1.99 cargo clippy --workspace --all-targets -- -D warnings
+  docker build -f Dockerfile.dev --build-arg RUST_VERSION=1.99.1 -t coldstore-dev:1.99 .
+  docker run --rm -e RUSTUP_TOOLCHAIN=1.99.1 -v "$PWD:/work" \
+      -v coldstore-cargo-registry:/usr/local/cargo/registry \
+      -v coldstore-cargo-git:/usr/local/cargo/git \
+      -v coldstore-target-199:/work/target \
+      coldstore-dev:1.99 cargo clippy --workspace --all-targets --all-features -- -D warnings
   ```
 
   Для каждой тулчейн-версии держите отдельный volume для `target`, иначе переключение сбрасывает
@@ -60,10 +75,12 @@
   (`127.0.0.1:0`).
 - Первая сборка компилирует RocksDB из C++: ≈1 мин на 32 ядрах, ≈10–30 мин на слабой машине.
   `target/` занимает ≈5 GB. Держите не менее 15 GB свободного места.
-- `Cargo.lock` находится в git-ignored (см. `AGENTS.md` §3.1): версии «плавают» при каждом свежем
-  резолве. Если чистая сборка сломалась без ваших изменений, сначала подозрейте апстрим-дрейф —
-  особенно `openraft`, который закреплен на пре-релизе (`0.10.0-alpha.18`). Не начинайте коммитить
-  lock-файл, пока об этом не попросят мейнтейнеры.
+- `Cargo.lock` закоммичен (см. `AGENTS.md` §3.1), поэтому все окружения разрешают один и тот же
+  граф. После изменения зависимостей обновите его минимально — `scripts/docker.sh run cargo update -p
+  <crate>` (либо просто сборкой) — и положите в тот же PR; CI проверяет `cargo metadata --locked`.
+  `cargo generate-lockfile` оставляйте для намеренного полного переразрешения, где просматривается
+  каждая поднятая версия. `openraft` закреплён точно (`=0.10.0-alpha.37`), потому что
+  пре-релизное требование без `=` «плывёт» между альфами.
 
 ---
 
@@ -73,20 +90,21 @@
 
 | Файл | Роль |
 |---|---|
-| `Dockerfile.dev` | `rust:1.91` + пакеты из §2.2 + `rustfmt`/`clippy`. Ничего не копирует из контекста. |
+| `Dockerfile.dev` | `rust:` + канал из `rust-toolchain.toml` (сейчас `1.91.1`) + пакеты из §2.2 + `rustfmt`/`clippy`. Ничего не копирует из контекста. |
 | `.dockerignore` | Держит контекст сборки пустым (`COPY` нет). |
 | `scripts/docker.sh` | Обёртки: собирают образ при необходимости, затем запускают cargo внутри. |
 
 ### 3.2 Команды
 
 ```bash
-scripts/docker.sh check-safe   # fmt-check → clippy -D warnings → unit → vtl-unit → build → hook-test
+scripts/docker.sh check-safe   # fmt-check → clippy -D warnings → lock → unit → vtl-unit → build → hook-test
 scripts/docker.sh test         # cargo test --workspace
 scripts/docker.sh build        # cargo build --workspace
-scripts/docker.sh clippy       # cargo clippy --workspace --all-targets -- -D warnings
+scripts/docker.sh clippy       # cargo clippy --workspace --all-targets --all-features -- -D warnings
 scripts/docker.sh fmt          # cargo fmt --all
 scripts/docker.sh fmt-check    # cargo fmt --all -- --check
 scripts/docker.sh vtl-unit     # cargo test -p coldstore-vtl --lib --tests
+scripts/docker.sh lock-check   # cargo metadata --locked (lock против манифестов)
 scripts/docker.sh hook-test    # поведение гейта ревью scripts/commit-msg (нужны только git + bash)
 scripts/docker.sh shell        # bash в образе, /work = репозиторий
 scripts/docker.sh run <cmd>    # что угодно, напр. run cargo tree -p coldstore-tape
@@ -135,7 +153,7 @@ PUT bucket → PUT object → `COLD` → GET 403 → restore 202 → GET, бай
 Те же команды, что и в CI, через `Makefile`:
 
 ```bash
-make check-safe     # fmt-check, clippy, unit, vtl-unit, build-debug, hook-test  ← гейт перед завершением
+make check-safe     # fmt-check, clippy, metadata-locked, unit, vtl-unit, build-debug, hook-test  ← гейт перед завершением
 make check-all      # fmt-check, clippy, test
 make vtl-unit
 cargo test -p coldstore-scheduler archive_staging_batch   # один тест
@@ -148,8 +166,8 @@ cargo test -p coldstore-scheduler archive_staging_batch   # один тест
 
 ## 5. Критерий готовности (часть про сборку)
 
-Прогоняйте тот же гейт, что и CI (`.github/workflows/rust.yml`: fmt check → clippy → build → test →
-`scripts/test-commit-msg.sh`):
+Прогоняйте тот же гейт, что и CI (`.github/workflows/rust.yml`: пин тулчейна + проверка дрейфа →
+`cargo metadata --locked` → fmt → clippy → build → test → `scripts/test-commit-msg.sh`):
 
 ```bash
 scripts/docker.sh check-safe    # быстрый гейт
@@ -157,10 +175,12 @@ scripts/docker.sh test          # полный набор, 116 тестов
 ```
 
 - [ ] `cargo fmt --all -- --check` чисто.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` чисто.
+- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` чисто.
 - [ ] `cargo build --workspace` успешно.
 - [ ] `cargo test --workspace` проходит (на момент написания — 116 тестов); новое поведение и каждая
       исправленная ошибка покрыты тестами.
+- [ ] `cargo metadata --locked` проходит; либо этот PR сам пересоздаёт `Cargo.lock`, и эта
+      пересборка входит в просмотренный дифф.
 - [ ] `scripts/test-commit-msg.sh` проходит (гейт ревью commit-msg; нужны только git + bash).
 - [ ] Ни одной добавленной или поднятой зависимости без обоснования в PR (`AGENTS.md` §2.5).
 - [ ] Хост не изменён, сервисы не оставлены запущенными, временные данные удалены.
@@ -174,10 +194,10 @@ scripts/docker.sh test          # полный набор, 116 тестов
 | `google/protobuf/timestamp.proto: File not found` | Нет `libprotobuf-dev` (§2.2). |
 | `protoc` не найден | Нет `protobuf-compiler`; в контейнере — пересобрать образ. |
 | `bindgen: ... libclang.so: NotFound` | Нет `clang`/`libclang-dev`. |
-| Чистая сборка падает без локальных изменений | `Cargo.lock` в git-ignored → свежий резолв подтянул новую версию апстрима, особенно alpha `openraft`. Закрепите локально и сообщите; молча коммитить lock-файл нельзя. |
+| Чистая сборка падает без локальных изменений | Закоммиченный `Cargo.lock` устарел либо разрешён другим тулчейном. Обновите его минимально (`scripts/docker.sh run cargo update -p <crate>`) и посмотрите на diff; быстрее всех «плывёт» alpha `openraft`. |
 | Cargo висит: `waiting for file lock on package cache` | Другой cargo (обычно второй контейнер) держит общий volume. Остановите его. |
 | Сборка сильно замедлилась / `target` раздут | `docker volume rm coldstore-target` (`scripts/docker.sh clean`) и пересборка. |
-| Clippy чист локально, но падает в CI | CI ставит `stable`, который «плывёт»; контейнер закреплен на 1.91. Воспроизведите через `--build-arg RUST_VERSION=<версия CI>` (§2.1) и чините, а не отключайте линт оптом. Так исправлено для rustc 1.99: `result_large_err` на `tonic::Status` (allow на уровне crate, `AGENTS.md` §10) и `useless_borrows_in_formatting` в `scheduler/src/lib.rs`. |
+| Clippy чист локально, но падает в CI | И CI, и контейнер используют канал из `rust-toolchain.toml`, так что расхождение означает: одно из мест в §2.1 уехало — сам файл либо две зафиксированные версии в workflow. Воспроизведите явным `docker build --build-arg RUST_VERSION=<версия>` плюс `-e RUSTUP_TOOLCHAIN=<версия>` (§2.1 — без переменной окружения файл тулчейна молча побеждает) и чините, а не отключайте линт оптом. Так исправлено для rustc 1.99: `result_large_err` на `tonic::Status` (allow на уровне crate, `AGENTS.md` §10) и `useless_borrows_in_formatting` в `scheduler/src/lib.rs`. |
 
 ---
 

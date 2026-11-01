@@ -3,6 +3,7 @@ name = "coldstore-node"
 description = "ColdStore single-node runtime for local and small deployments"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

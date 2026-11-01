@@ -3,6 +3,7 @@ name = "coldstore-scheduler"
 description = "ColdStore scheduler worker (business orchestration hub)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

@@ -1,4 +1,4 @@
-.PHONY: build build-debug fmt fmt-check clippy test unit test-unit vtl-unit vtl-check hook-test check check-all check-safe clean help install-hooks install-tools setup lint run-metadata run-gateway run-scheduler run-cache run-tape run-node run-node-no-tape
+.PHONY: build build-debug fmt fmt-check clippy test unit test-unit vtl-unit vtl-check hook-test metadata-locked check check-all check-safe clean help install-hooks install-tools setup lint run-metadata run-gateway run-scheduler run-cache run-tape run-node run-node-no-tape
 
 .DEFAULT_GOAL := help
 
@@ -16,9 +16,9 @@ fmt:
 fmt-check:
 	@cargo fmt --all -- --check
 clippy:
-	@cargo clippy --all-targets --all-features -- -D warnings
+	@cargo clippy --workspace --all-targets --all-features -- -D warnings
 test:
-	@cargo test --workspace --all-features
+	@cargo test --workspace
 unit test-unit:
 	@cargo test --workspace --lib --bins
 vtl-unit:
@@ -31,9 +31,13 @@ hook-test:
 	@scripts/test-commit-msg.sh
 check:
 	@cargo check --all-targets --all-features
+# `cargo metadata --locked` fails when Cargo.lock no longer matches the manifests, which is the
+# only mechanical guard now that the lock is committed (AGENTS.md §3.1).
+metadata-locked:
+	@cargo metadata --locked --format-version 1 > /dev/null
 check-all: fmt-check clippy test
-check-safe: fmt-check clippy unit vtl-unit build-debug hook-test
-	@echo "Safe verification passed (fmt/clippy/unit/vtl-unit/build/hook-test only)."
+check-safe: fmt-check clippy metadata-locked unit vtl-unit build-debug hook-test
+	@echo "Safe verification passed (fmt/clippy/lock/unit/vtl-unit/build/hook-test only)."
 clean:
 	@cargo clean
 
@@ -91,6 +95,6 @@ help:
 	@echo "ColdStore Workspace Makefile"
 	@echo ""
 	@echo "Build:   build build-debug clean"
-	@echo "Quality: fmt fmt-check clippy test unit vtl-unit vtl-check hook-test check check-all check-safe lint"
+	@echo "Quality: fmt fmt-check clippy metadata-locked test unit vtl-unit vtl-check hook-test check check-all check-safe lint"
 	@echo "Run:     run-node run-node-no-tape run-metadata run-gateway run-scheduler run-cache run-tape"
 	@echo "Setup:   setup install-tools install-hooks (add FORCE=1 to install outside the repo's hooks dir)"

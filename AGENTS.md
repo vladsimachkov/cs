@@ -3,8 +3,8 @@
 Operating manual for AI coding agents (Codex, Claude Code, Cursor, Copilot, Hermes, …) and for humans
 working in this repository. Read it fully before changing code.
 
-Last verified against commit `c205a5b` ("Harden cold archive consistency (#8)"): workspace builds,
-`cargo test --workspace` passes (116 tests), and the e2e smoke flow in §3.4 was run by hand.
+Last verified against commit `cc1a5db` plus the PL-06a working state (committed `Cargo.lock`, pinned
+toolchain): the workspace builds, `cargo test --workspace` passes (116 tests), and the e2e smoke flow in §3.4 was run by hand.
 If you change anything this file states as fact, update this file in the same PR.
 
 ---
@@ -49,9 +49,11 @@ Raft metadata, bundle aggregation, dual copy / EC, offline-tape workflows, ≥30
    A failing test means the logic is wrong.
 4. **Don't silently break string contracts** (§6.5). They are parsed across crate boundaries.
 5. **Don't edit generated code.** Change `crates/proto/proto/*.proto`; `tonic-build` regenerates on build.
-6. **Don't add or bump dependencies casually.** `openraft = "0.10.0-alpha.18"` is a pre-release pin,
-   `rocksdb` compiles C++ for minutes, and `Cargo.lock` is git-ignored (§3.1). Justify every new
-   dependency in the PR.
+6. **Don't add or bump dependencies casually.** `openraft` is pinned **exactly** to
+   `=0.10.0-alpha.37` (a bare `"0.10.0-alpha.18"` was a floating caret range that admitted newer
+   alphas silently — see `crates/metadata/Cargo.toml`), and `rocksdb` compiles C++ for minutes.
+   `Cargo.lock` is committed (§3.1), so any bump changes the lock too: regenerate it, stage both, and
+   justify the change in the PR.
 7. **Don't claim features.** When you implement a README capability, update the table in
    `README_RUST.md` (and §1 here) in the same PR. When you can't finish one, say so in the PR.
 8. Tests must not use the network beyond loopback and must not need root, devices, or external services.
@@ -62,10 +64,10 @@ Raft metadata, bundle aggregation, dual copy / EC, offline-tape workflows, ≥30
      one commit is not enough — PRs are squash-merged (§11), so no agent commit is the final one. A review
      is invalid if any untracked or modified path was hidden from the reviewer.
    - **What counts as a code change.** Anything under `crates/` (including `crates/proto/proto/*.proto`),
-     `Cargo.toml`, `Cargo.lock`, `Makefile`, `Dockerfile*`, `scripts/`, `configs/`, `.github/`,
-     `.gitignore`. A commit touching only `*.md` is exempt — unless it edits `AGENTS.md` or
-     `docs/BUILD*.md`, which define how code is built and reviewed. Anything unlisted and not `*.md`
-     counts as a code change unless a human classifies it otherwise.
+     `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `Makefile`, `Dockerfile*`, `scripts/`,
+     `configs/`, `.github/`, `.gitignore`. A commit touching only `*.md` is exempt — unless it edits
+     `AGENTS.md` or `docs/BUILD*.md`, which define how code is built and reviewed. Anything unlisted
+     and not `*.md` counts as a code change unless a human classifies it otherwise.
    - **Who may review.** A different agent session that shares no conversation with the author. It is
      given the review artifact (§7.5), §2/§6 of this file, and the author's recorded command and test
      output — and none of the author's conversation history. The isolation is about the author's
@@ -99,8 +101,13 @@ Raft metadata, bundle aggregation, dual copy / EC, offline-tape workflows, ≥30
 
 ### 3.1 Toolchain
 
-- **Rust:** stable. Verified with 1.91. The "1.75+" in `README_RUST.md` is outdated; current
-  dependency versions need a newer compiler. Edition 2021, no `rust-toolchain` file.
+- **Rust: pinned.** `rust-toolchain.toml` is the source of truth (`channel = "1.91.1"`, components
+  `rustfmt`, `clippy`). `scripts/docker.sh` reads that channel and passes it to the image build, so
+  the container follows the file automatically. **A bump is not one edit:** the version is also
+  hard-coded twice in `.github/workflows/rust.yml` (`uses: dtolnay/rust-toolchain@<version>` and the
+  `RUSTUP_TOOLCHAIN` of the drift step). The drift step fails when that `RUSTUP_TOOLCHAIN` and
+  `channel` disagree; a `uses:`-only edit is inert, because the toolchain file governs every other
+  step. `rust-version = "1.91"` in the workspace is the MSRV, a different thing. Edition 2021.
 - **System packages:** `protobuf-compiler` (protoc), `libprotobuf-dev` (ships
   `/usr/include/google/protobuf/*.proto`; without it prost cannot resolve
   `google/protobuf/timestamp.proto` and `coldstore-proto` fails to build), `clang`,
@@ -110,21 +117,26 @@ Raft metadata, bundle aggregation, dual copy / EC, offline-tape workflows, ≥30
 - **Components:** `rustfmt`, `clippy`.
 - **First build is slow.** RocksDB is compiled from C++ source (≈10–30 min on a small machine).
   Incremental builds are fast afterwards. Don't `cargo clean` without reason.
-- **`Cargo.lock` is in `.gitignore`.** Versions float on every fresh resolve. If a clean build breaks
-  without your change, suspect upstream drift first (openraft alpha especially) and say so in the PR.
-  Don't start committing the lock file unless maintainers ask.
+- **`Cargo.lock` is committed** (decision at PL-06a, 2026-11): a binaries workspace must resolve one
+  graph everywhere, and openraft is pinned exactly (`=0.10.0-alpha.37`) for the same reason. After a
+  dependency change, refresh the lock **minimally**: `scripts/docker.sh run cargo update -p <crate>
+  [--precise <version>]`, or simply build — cargo patches only what the manifest change requires —
+  then commit the lock in the same PR. `cargo generate-lockfile` ignores the existing lock and
+  re-resolves every package to the newest compatible version; use it only for a deliberate full
+  refresh, and review the whole diff. CI and `check-safe` run `cargo metadata --locked`, so a stale
+  lock fails the build.
 
 ### 3.2 Everyday commands
 
 | Purpose | Command |
 |---|---|
 | Format | `cargo fmt --all` |
-| Lint (same as CI) | `cargo clippy --workspace --all-targets -- -D warnings` |
+| Lint (same as CI) | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
 | All tests | `cargo test --workspace` (116 tests, ~1 s runtime once built) |
 | One crate / one test | `cargo test -p coldstore-scheduler archive_staging_batch` |
 | VTL harness only | `make vtl-unit` |
-| Default pre-finish gate | `make check-safe` (fmt-check, clippy, unit, vtl-unit, build-debug, hook-test) |
-| What CI runs | fmt check → clippy → `cargo build --workspace` → `cargo test --workspace` → `scripts/test-commit-msg.sh` (`.github/workflows/rust.yml`) |
+| Default pre-finish gate | `make check-safe` (fmt-check, clippy, `metadata-locked`, unit, vtl-unit, build-debug, hook-test) |
+| What CI runs | toolchain pin + drift check against `rust-toolchain.toml` → `cargo metadata --locked` → fmt check → clippy → `cargo build --workspace` → `cargo test --workspace` → `scripts/test-commit-msg.sh` (`.github/workflows/rust.yml`; the same lock and lint checks also run in `scripts/docker.sh check-safe`, which is the authoritative gate while Actions are off — disabled by the maintainer, 2026-11) |
 
 Tests spin up in-process tonic servers on `127.0.0.1:0` and use temp dirs. They need nothing external.
 
@@ -173,9 +185,10 @@ path-style addressing.
 Full policy, mounts, cache rules and troubleshooting: **[`docs/BUILD.md`](docs/BUILD.md)**
 (`docs/BUILD.ru.md` in Russian). Short version:
 
-- `Dockerfile.dev` = `rust:1.91` + the §3.1 system packages + `rustfmt`/`clippy`; `scripts/docker.sh`
+- `Dockerfile.dev` = `rust:` + the `rust-toolchain.toml` channel (currently `1.91.1`) + the §3.1
+  system packages + `rustfmt`/`clippy`; `scripts/docker.sh`
   wraps it. Use this instead of installing anything on the host.
-- `scripts/docker.sh check-safe | test | build | clippy | fmt | fmt-check | vtl-unit | hook-test | shell | run <cmd> | clean`.
+- `scripts/docker.sh check-safe | test | build | clippy | fmt | fmt-check | vtl-unit | lock-check | hook-test | shell | run <cmd> | clean`.
 - Repo at `/work`; `cargo registry`/`git` and `target/` are named volumes, so runs stay incremental.
   Cold `cargo build --workspace` ≈1 min on 32 cores, `target` ≈5 GB.
 - The node binds `127.0.0.1` inside the container, so the §3.4 smoke check runs *inside* one
@@ -199,8 +212,8 @@ Full policy, mounts, cache rules and troubleshooting: **[`docs/BUILD.md`](docs/B
 
 Other paths:
 - `configs/`: node YAMLs.
-- `scripts/pre-commit`: fmt/clippy/check/test gate; it skips when no host cargo is present (§3.5 is the
-  sanctioned build). `scripts/commit-msg`: cargo-free review gate for §2.9, its behavior pinned by
+- `scripts/pre-commit`: lock/fmt/clippy/check/test gate; it skips when no host cargo is present (§3.5 is
+  the sanctioned build). `scripts/commit-msg`: cargo-free review gate for §2.9, its behavior pinned by
   `scripts/test-commit-msg.sh` (`make hook-test`). Install the hooks with `make install-hooks`, and
   re-run it after any change to `scripts/commit-msg` — the hook is a copy and nothing detects a stale
   installed one.
@@ -491,9 +504,11 @@ simulator) → 6 → 7.
       the commit (§2.9); blocking findings fixed and re-reviewed, trailers present, or an explicit
       human waiver recorded.
 - [ ] `scripts/docker.sh fmt-check` clean (or `cargo fmt --all -- --check` natively); `scripts/docker.sh clippy`
-      clean (same as `cargo clippy --workspace --all-targets -- -D warnings`).
+      clean (same as `cargo clippy --workspace --all-targets --all-features -- -D warnings`).
 - [ ] `scripts/docker.sh test` passes (same as `cargo test --workspace`); new behavior and every fixed
       defect have tests.
+- [ ] `scripts/docker.sh lock-check` passes (`cargo metadata --locked`), or the change itself
+      regenerates `Cargo.lock` and that regeneration is part of the reviewed diff.
 - [ ] No safety check weakened (§2.3); string contracts and the Status→S3 mapping intact or updated on both sides.
 - [ ] Proto/snapshot compatibility considered (§6.7–6.8).
 - [ ] No hardware touched, no services left running, temp data removed.

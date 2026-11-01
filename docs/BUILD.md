@@ -24,17 +24,31 @@ Use the container. If a native build is impossible, say so in the PR instead of 
 
 ### 2.1 Rust
 
-- Stable toolchain. Verified with **1.91**; the "1.75+" in `README_RUST.md` is stale — current
-  dependency versions need a newer compiler. Edition 2021, no `rust-toolchain` file.
-- Components: `rustfmt`, `clippy`.
-- The dev image pins the toolchain (`ARG RUST_VERSION`, default 1.91). To check the workspace
-  against a newer stable before CI floats to it:
+- The toolchain is **pinned in `rust-toolchain.toml`** (currently `1.91.1`), and that file is the
+  source of truth. `scripts/docker.sh` reads its `channel` and passes it as `--build-arg
+  RUST_VERSION` to the image build; `.github/workflows/rust.yml` pins the same version and has a
+  step that fails if the two ever disagree. Components `rustfmt` and `clippy` are requested there and
+  verified when the image builds.
+- `Cargo.toml` also declares `rust-version = "1.91"`. That is the **MSRV** — the oldest toolchain
+  that must still build — not the toolchain we build with. Raise it only with a reason in the PR.
+- **`Cargo.lock` is committed.** This is a binaries workspace, so CI and every dev container must
+  resolve the same graph (openraft is pinned exactly, `=0.10.0-alpha.37`). After a dependency change,
+  refresh the lock minimally — `scripts/docker.sh run cargo update -p <crate> [--precise <version>]`,
+  or just build — and commit the lock in the same PR. `cargo generate-lockfile` re-resolves every
+  package from scratch and is for a deliberate full refresh only. CI runs `cargo metadata --locked`,
+  so a stale lock fails the build.
+- **`rust-toolchain.toml` overrides the image tag.** A container built with a different
+  `RUST_VERSION` silently auto-installs and uses the pinned toolchain instead (verified: a
+  `1.99` image downloaded 1.91.1 and reported it). To really test another toolchain, set
+  `RUSTUP_TOOLCHAIN`; to make the mismatch fail loudly instead, set `RUSTUP_AUTO_INSTALL=0`.
 
   ```bash
-  docker build -f Dockerfile.dev --build-arg RUST_VERSION=1.99 -t coldstore-dev:1.99 .
-  docker run --rm -v "$PWD:/work" -v coldstore-cargo-registry:/usr/local/cargo/registry \
-      -v coldstore-cargo-git:/usr/local/cargo/git -v coldstore-target-199:/work/target \
-      coldstore-dev:1.99 cargo clippy --workspace --all-targets -- -D warnings
+  docker build -f Dockerfile.dev --build-arg RUST_VERSION=1.99.1 -t coldstore-dev:1.99 .
+  docker run --rm -e RUSTUP_TOOLCHAIN=1.99.1 -v "$PWD:/work" \
+      -v coldstore-cargo-registry:/usr/local/cargo/registry \
+      -v coldstore-cargo-git:/usr/local/cargo/git \
+      -v coldstore-target-199:/work/target \
+      coldstore-dev:1.99 cargo clippy --workspace --all-targets --all-features -- -D warnings
   ```
 
   Use a separate `target` volume per toolchain, otherwise each switch invalidates the other's
@@ -58,9 +72,12 @@ GitHub `ubuntu-latest` runners preinstall it; it is now listed explicitly in
 - Cargo needs crates.io on first fetch. Tests themselves only use loopback (`127.0.0.1:0`).
 - First build compiles RocksDB from C++: ≈1 min on 32 cores, ≈10–30 min on a small machine.
   `target/` reaches ≈5 GB. Keep ≥15 GB free.
-- `Cargo.lock` is git-ignored (§`AGENTS.md` 3.1): versions float on every fresh resolve. If a clean
-  build breaks without your change, suspect upstream drift first — `openraft` is a pre-release pin
-  (`0.10.0-alpha.18`). Do not start committing the lock file unless maintainers ask.
+- `Cargo.lock` is committed (§`AGENTS.md` 3.1), so every environment resolves the same graph. After
+  a dependency change refresh it minimally with `scripts/docker.sh run cargo update -p <crate>` (or
+  just build) and commit the lock in the same PR; CI checks `cargo metadata --locked`. Reserve
+  `cargo generate-lockfile` for a deliberate full re-resolution, where you review every bumped
+  package. `openraft` is pinned exactly (`=0.10.0-alpha.37`) because a bare pre-release requirement
+  floats across alphas.
 
 ---
 
@@ -70,20 +87,21 @@ GitHub `ubuntu-latest` runners preinstall it; it is now listed explicitly in
 
 | File | Role |
 |---|---|
-| `Dockerfile.dev` | `rust:1.91` + §2.2 packages + `rustfmt`/`clippy`. Copies nothing from the context. |
+| `Dockerfile.dev` | `rust:` + the `rust-toolchain.toml` channel (currently `1.91.1`) + §2.2 packages + `rustfmt`/`clippy`. Copies nothing from the context. |
 | `.dockerignore` | Keeps the build context empty (nothing is `COPY`ed). |
 | `scripts/docker.sh` | Wrappers that build the image if needed, then run cargo in it. |
 
 ### 3.2 Commands
 
 ```bash
-scripts/docker.sh check-safe   # fmt-check → clippy -D warnings → unit → vtl-unit → build → hook-test
+scripts/docker.sh check-safe   # fmt-check → clippy -D warnings → lock → unit → vtl-unit → build → hook-test
 scripts/docker.sh test         # cargo test --workspace
 scripts/docker.sh build        # cargo build --workspace
-scripts/docker.sh clippy       # cargo clippy --workspace --all-targets -- -D warnings
+scripts/docker.sh clippy       # cargo clippy --workspace --all-targets --all-features -- -D warnings
 scripts/docker.sh fmt          # cargo fmt --all
 scripts/docker.sh fmt-check    # cargo fmt --all -- --check
 scripts/docker.sh vtl-unit     # cargo test -p coldstore-vtl --lib --tests
+scripts/docker.sh lock-check   # cargo metadata --locked (Cargo.lock vs manifests)
 scripts/docker.sh hook-test    # behavior of the scripts/commit-msg review gate (git + bash only)
 scripts/docker.sh shell        # bash in the image, /work = repo
 scripts/docker.sh run <cmd>    # anything else, e.g. run cargo tree -p coldstore-tape
@@ -132,7 +150,7 @@ throwaway directory under `/tmp`.
 Same commands as CI, via the `Makefile`:
 
 ```bash
-make check-safe     # fmt-check, clippy, unit, vtl-unit, build-debug, hook-test  ← pre-finish gate
+make check-safe     # fmt-check, clippy, metadata-locked, unit, vtl-unit, build-debug, hook-test  ← pre-finish gate
 make check-all      # fmt-check, clippy, test
 make vtl-unit
 cargo test -p coldstore-scheduler archive_staging_batch   # one test
@@ -145,8 +163,8 @@ packages — install those manually or use the container.
 
 ## 5. Definition of done (build side)
 
-Run the same gate CI runs (`.github/workflows/rust.yml`: fmt check → clippy → build → test →
-`scripts/test-commit-msg.sh`):
+Run the same gate CI runs (`.github/workflows/rust.yml`: toolchain pin + drift check →
+`cargo metadata --locked` → fmt → clippy → build → test → `scripts/test-commit-msg.sh`):
 
 ```bash
 scripts/docker.sh check-safe    # fast gate
@@ -154,10 +172,12 @@ scripts/docker.sh test          # full suite, 116 tests
 ```
 
 - [ ] `cargo fmt --all -- --check` clean.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean.
 - [ ] `cargo build --workspace` succeeds.
 - [ ] `cargo test --workspace` passes (116 tests at the time of writing); new behavior and every
       fixed defect have tests.
+- [ ] `cargo metadata --locked` passes, or this change itself regenerates `Cargo.lock` and that
+      regeneration is part of the reviewed diff.
 - [ ] `scripts/test-commit-msg.sh` passes (the commit-msg review gate; needs git + bash only).
 - [ ] No dependency added or bumped without justification in the PR (`AGENTS.md` §2.5).
 - [ ] No host modifications, no services left running, temp data removed.
@@ -171,10 +191,10 @@ scripts/docker.sh test          # full suite, 116 tests
 | `google/protobuf/timestamp.proto: File not found` | Missing `libprotobuf-dev` (§2.2). |
 | `protoc` not found / `PROTOCOL_BUFFERS_PYTHON...` | Missing `protobuf-compiler`; in the container rebuild the image. |
 | `bindgen: ... libclang.so: NotFound` | Missing `clang`/`libclang-dev`. |
-| Build fails on a clean checkout with no local change | `Cargo.lock` is ignored → fresh resolve picked up a new upstream version, `openraft` alpha especially. Pin locally, report it; do not commit the lock file silently. |
+| Build fails on a clean checkout with no local change | The committed `Cargo.lock` is stale or was resolved with a different toolchain. Refresh it minimally (`scripts/docker.sh run cargo update -p <crate>`) and review the diff; `openraft` alpha drifts fastest. |
 | Cargo hangs with `waiting for file lock on package cache` | Another cargo (usually a second container) holds the shared volume. Stop it. |
 | Build got much slower / `target` huge | `docker volume rm coldstore-target` (`scripts/docker.sh clean`) and rebuild. |
-| Clippy is clean locally but fails in CI | CI installs `stable`, which floats; the container pins 1.91. Reproduce with `--build-arg RUST_VERSION=<ci version>` (§2.1) and fix, do not disable the lint wholesale. Fixed this way for rustc 1.99: `result_large_err` on `tonic::Status` (crate-wide allow, `AGENTS.md` §10) and `useless_borrows_in_formatting` in `scheduler/src/lib.rs`. |
+| Clippy is clean locally but fails in CI | Both CI and the container use the `rust-toolchain.toml` channel, so a mismatch means one of the places §2.1 names drifted (the file itself, or the two hard-coded versions in the workflow). Reproduce with a raw `docker build --build-arg RUST_VERSION=<version>` plus `-e RUSTUP_TOOLCHAIN=<version>` (§2.1 — without the env var the toolchain file silently wins) and fix, do not disable the lint wholesale. Fixed this way for rustc 1.99: `result_large_err` on `tonic::Status` (crate-wide allow, `AGENTS.md` §10) and `useless_borrows_in_formatting` in `scheduler/src/lib.rs`. |
 
 ---
 
