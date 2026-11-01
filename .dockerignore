@@ -1,0 +1,3 @@
+# The dev image copies nothing from the context; keep the build context empty.
+*
+!.dockerignore

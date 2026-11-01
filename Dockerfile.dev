@@ -1,0 +1,34 @@
+# Development / CI image for ColdStore.
+# Everything the toolchain needs lives in this image; nothing is installed on the host.
+#
+#   docker build -f Dockerfile.dev -t coldstore-dev .
+#   docker run --rm \
+#       -v <repo>:/work \
+#       -v coldstore-cargo-registry:/usr/local/cargo/registry \
+#       -v coldstore-target:/work/target \
+#       coldstore-dev cargo test --workspace
+#
+# The registry / git caches and ./target are named volumes: they survive container
+# removal and keep incremental builds fast. Do NOT mount a volume over all of
+# /usr/local/cargo — the rustup shims for cargo/rustc live in /usr/local/cargo/bin.
+#
+# See scripts/docker.sh for ready-made wrappers.
+FROM rust:1.91
+
+# protobuf-compiler -> tonic-build; libprotobuf-dev ships /usr/include/google/protobuf/*.proto,
+# which prost needs to resolve `google/protobuf/timestamp.proto` (protobuf-compiler alone does not
+# provide it); clang/libclang-dev/llvm-dev -> RocksDB bindgen.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      protobuf-compiler \
+      libprotobuf-dev \
+      clang \
+      libclang-dev \
+      llvm-dev \
+      ca-certificates \
+      pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN rustup component add rustfmt clippy
+
+WORKDIR /work
