@@ -3,8 +3,12 @@
 #
 #   scripts/docker.sh build            # cargo build --workspace
 #   scripts/docker.sh test             # cargo test --workspace
-#   scripts/docker.sh check-safe       # fmt-check, clippy, unit, vtl-unit, build-debug
+#   scripts/docker.sh check-safe       # fmt-check, clippy, unit, vtl-unit, build, hook-test
+#   scripts/docker.sh clippy           # cargo clippy --workspace --all-targets -- -D warnings
 #   scripts/docker.sh fmt              # cargo fmt --all
+#   scripts/docker.sh fmt-check        # cargo fmt --all -- --check
+#   scripts/docker.sh vtl-unit         # cargo test -p coldstore-vtl --lib --tests
+#   scripts/docker.sh hook-test        # behavior of the scripts/commit-msg review gate
 #   scripts/docker.sh shell            # interactive shell in the dev image
 #   scripts/docker.sh run <args...>    # any command, e.g. run cargo tree -p coldstore-tape
 #
@@ -42,6 +46,7 @@ case "$cmd" in
   fmt)        build_image; run cargo fmt --all ;;
   fmt-check)  build_image; run cargo fmt --all -- --check ;;
   vtl-unit)   build_image; run cargo test -p coldstore-vtl --lib --tests ;;
+  hook-test)  build_image; run scripts/test-commit-msg.sh ;;
   check-safe)
     build_image
     run cargo fmt --all -- --check
@@ -49,12 +54,13 @@ case "$cmd" in
     run cargo test --workspace --lib --bins
     run cargo test -p coldstore-vtl --lib --tests
     run cargo build --workspace
-    echo "Safe verification passed (fmt/clippy/unit/vtl-unit/build, all in Docker)."
+    run scripts/test-commit-msg.sh
+    echo "Safe verification passed (fmt/clippy/unit/vtl-unit/build/hook-test, all in Docker)."
     ;;
   shell)      build_image; run bash ;;
   run)        build_image; run "$@" ;;
   clean)      docker volume rm coldstore-target ;;
   help|*)
-    sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;
 esac

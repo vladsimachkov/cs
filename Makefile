@@ -1,4 +1,4 @@
-.PHONY: build build-debug fmt fmt-check clippy test unit test-unit vtl-unit vtl-check check check-all check-safe clean help install-hooks install-tools setup lint run-metadata run-gateway run-scheduler run-cache run-tape run-node run-node-no-tape
+.PHONY: build build-debug fmt fmt-check clippy test unit test-unit vtl-unit vtl-check hook-test check check-all check-safe clean help install-hooks install-tools setup lint run-metadata run-gateway run-scheduler run-cache run-tape run-node run-node-no-tape
 
 .DEFAULT_GOAL := help
 
@@ -25,11 +25,15 @@ vtl-unit:
 	@cargo test -p coldstore-vtl --lib --tests
 vtl-check:
 	@cargo check -p coldstore-vtl
+
+# Behavior of the AGENTS.md §2.9 review gate. Needs git and bash only, never cargo.
+hook-test:
+	@scripts/test-commit-msg.sh
 check:
 	@cargo check --all-targets --all-features
 check-all: fmt-check clippy test
-check-safe: fmt-check clippy unit vtl-unit build-debug
-	@echo "Safe verification passed (fmt/clippy/unit/vtl-unit/build only)."
+check-safe: fmt-check clippy unit vtl-unit build-debug hook-test
+	@echo "Safe verification passed (fmt/clippy/unit/vtl-unit/build/hook-test only)."
 clean:
 	@cargo clean
 
@@ -51,10 +55,30 @@ run-node-no-tape:
 lint: fmt-check clippy check unit
 	@echo "All lint checks passed (unit-only)."
 
+# `git rev-parse --git-path hooks` so worktrees, submodules and core.hooksPath all land in the
+# right place; hardcoding .git/hooks does not.
+HOOKS_DIR := $(shell git rev-parse --git-path hooks 2>/dev/null || echo .git/hooks)
+# --git-common-dir, not --git-dir: inside a linked worktree the hooks still live in the main
+# .git/hooks, and comparing against the worktree dir would misfire and blame core.hooksPath.
+REPO_HOOKS_DIR := $(shell git rev-parse --git-common-dir 2>/dev/null || echo .git)/hooks
+
+# core.hooksPath may point somewhere outside the repository (husky-style). Overwriting hooks
+# there silently would replace someone else's hooks, so require an explicit FORCE=1.
 install-hooks:
-	@cp scripts/pre-commit .git/hooks/pre-commit
-	@chmod +x .git/hooks/pre-commit
-	@echo "Pre-commit hook installed."
+	@h="$(HOOKS_DIR)"; r="$(REPO_HOOKS_DIR)"; \
+	ha=$$(cd "$$h" 2>/dev/null && pwd || printf '%s' "$$h"); \
+	ra=$$(cd "$$r" 2>/dev/null && pwd || printf '%s' "$$r"); \
+	if [ "$$ha" != "$$ra" ] && [ -z "$(FORCE)" ]; then \
+		echo "git hooks resolve to $$ha, which is not the repository's own $$ra."; \
+		echo "Refusing to overwrite hooks outside the repository; re-run with FORCE=1 to proceed."; \
+		exit 1; \
+	fi
+	@mkdir -p "$(HOOKS_DIR)"
+	@cp scripts/pre-commit "$(HOOKS_DIR)/pre-commit"
+	@chmod +x "$(HOOKS_DIR)/pre-commit"
+	@cp scripts/commit-msg "$(HOOKS_DIR)/commit-msg"
+	@chmod +x "$(HOOKS_DIR)/commit-msg"
+	@echo "Hooks installed in $(HOOKS_DIR): pre-commit (skips when no host cargo) and commit-msg (review gate, AGENTS.md §2.9)."
 
 install-tools:
 	@rustup component add rustfmt clippy
@@ -67,6 +91,6 @@ help:
 	@echo "ColdStore Workspace Makefile"
 	@echo ""
 	@echo "Build:   build build-debug clean"
-	@echo "Quality: fmt fmt-check clippy test unit vtl-unit vtl-check check check-all check-safe lint"
+	@echo "Quality: fmt fmt-check clippy test unit vtl-unit vtl-check hook-test check check-all check-safe lint"
 	@echo "Run:     run-node run-node-no-tape run-metadata run-gateway run-scheduler run-cache run-tape"
-	@echo "Setup:   setup install-tools install-hooks"
+	@echo "Setup:   setup install-tools install-hooks (add FORCE=1 to install outside the repo's hooks dir)"

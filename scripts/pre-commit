@@ -10,6 +10,14 @@ failed=0
 
 echo -e "${YELLOW}[pre-commit]${NC} Running checks..."
 
+# This workspace builds inside Docker (AGENTS.md §3.5); a host cargo is optional.
+# Skip rather than abort, so `make install-hooks` is safe on a machine without Rust.
+if ! command -v cargo >/dev/null 2>&1; then
+    echo -e "${YELLOW}cargo not on this host; skipping the pre-commit cargo checks.${NC}"
+    echo -e "${YELLOW}Run 'scripts/docker.sh check-safe' before committing (AGENTS.md §3.5).${NC}"
+    exit 0
+fi
+
 # 1. cargo fmt -- check
 echo -e "${YELLOW}[1/4]${NC} cargo fmt --check"
 if ! cargo fmt --all -- --check 2>/dev/null; then

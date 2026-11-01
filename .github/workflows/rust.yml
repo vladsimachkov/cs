@@ -47,3 +47,7 @@ jobs:
 
     - name: cargo test
       run: cargo test --workspace --verbose
+
+    # Needs only git and bash; pins the behavior of the AGENTS.md §2.9 review gate.
+    - name: commit-msg hook tests
+      run: scripts/test-commit-msg.sh

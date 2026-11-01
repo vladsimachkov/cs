@@ -55,6 +55,43 @@ Raft metadata, bundle aggregation, dual copy / EC, offline-tape workflows, ≥30
 7. **Don't claim features.** When you implement a README capability, update the table in
    `README_RUST.md` (and §1 here) in the same PR. When you can't finish one, say so in the PR.
 8. Tests must not use the network beyond loopback and must not need root, devices, or external services.
+9. **Every code change is reviewed by an independent reviewer agent before it is committed or pushed.**
+   - **Unit of review.** The whole change as it will land on `main`: the cumulative branch diff against
+     the merge base, the working-tree diff, **and the full contents of every untracked path** — not just
+     their names (`git status --porcelain` prints names only; use `git add -N .` first, §7.5). Reviewing
+     one commit is not enough — PRs are squash-merged (§11), so no agent commit is the final one. A review
+     is invalid if any untracked or modified path was hidden from the reviewer.
+   - **What counts as a code change.** Anything under `crates/` (including `crates/proto/proto/*.proto`),
+     `Cargo.toml`, `Cargo.lock`, `Makefile`, `Dockerfile*`, `scripts/`, `configs/`, `.github/`,
+     `.gitignore`. A commit touching only `*.md` is exempt — unless it edits `AGENTS.md` or
+     `docs/BUILD*.md`, which define how code is built and reviewed. Anything unlisted and not `*.md`
+     counts as a code change unless a human classifies it otherwise.
+   - **Who may review.** A different agent session that shares no conversation with the author. It is
+     given the review artifact (§7.5), §2/§6 of this file, and the author's recorded command and test
+     output — and none of the author's conversation history. The isolation is about the author's
+     reasoning, not about withholding the repository: the reviewer may read any file in the tree, since
+     it has to judge docs-vs-reality and test quality. The agent that wrote the change may not review
+     it. Human-authored changes are reviewed on the same terms.
+   - **When.** After the pre-finish gate is green (`scripts/docker.sh check-safe`, §3.5; `make check-safe`,
+     §3.2) and before `git commit` or `git push`. Any edit after a review invalidates it — re-review.
+   - **What the reviewer checks.** The §2 hard rules; the §6 invariants; that new behavior has tests,
+     that they are meaningful, and that they match the author's recorded evidence that they fail without
+     the change (the reviewer runs nothing and edits nothing — the author puts the command and its output
+     in the PR); string contracts and the Status→S3 mapping; proto/snapshot compatibility (§6.7–6.8);
+     whether the docs still match reality. Findings are `file:line` + why.
+   - **Verdict.** Blocking findings are fixed and re-reviewed; commit only when the reviewer reports
+     none. The PR carries the reviewer's report verbatim (§11) and the commit carries the
+     `Reviewed-by:` / `Review-scope:` trailers (§7.5). `scripts/commit-msg` rejects code-path commits
+     without them, but only where it is installed (`make install-hooks`). It is a reminder, not a
+     substitute for the review. Git does not invoke `commit-msg` at all for `git cherry-pick`,
+     `git revert` or `git am`; `--amend` of a message alone and `--allow-empty` reach it with an empty
+     staged diff, `--no-verify` skips it and `core.hooksPath` redirects it elsewhere; and nothing is
+     checked inside a merge commit — not a conflict resolution, nor any other file staged into it.
+   - **Waiver.** Only on explicit human request, quoted verbatim in the PR and as a `Waived-by:` trailer
+     with a non-empty value. Never available for changes touching §6.7–6.8 formats, §2.3 safety checks,
+     `.github/`, or this rule. The hook enforces only part of the path-detectable floor (`.github/`,
+     `crates/proto/proto/`, `AGENTS.md`, `docs/BUILD*.md`, `scripts/commit-msg`,
+     `scripts/test-commit-msg.sh`); the rest is on the reviewer and the PR.
 
 ---
 
@@ -86,8 +123,8 @@ Raft metadata, bundle aggregation, dual copy / EC, offline-tape workflows, ≥30
 | All tests | `cargo test --workspace` (116 tests, ~1 s runtime once built) |
 | One crate / one test | `cargo test -p coldstore-scheduler archive_staging_batch` |
 | VTL harness only | `make vtl-unit` |
-| Default pre-finish gate | `make check-safe` (fmt-check, clippy, unit, vtl-unit, build-debug) |
-| What CI runs | fmt check → clippy → `cargo build --workspace` → `cargo test --workspace` (`.github/workflows/rust.yml`) |
+| Default pre-finish gate | `make check-safe` (fmt-check, clippy, unit, vtl-unit, build-debug, hook-test) |
+| What CI runs | fmt check → clippy → `cargo build --workspace` → `cargo test --workspace` → `scripts/test-commit-msg.sh` (`.github/workflows/rust.yml`) |
 
 Tests spin up in-process tonic servers on `127.0.0.1:0` and use temp dirs. They need nothing external.
 
@@ -138,7 +175,7 @@ Full policy, mounts, cache rules and troubleshooting: **[`docs/BUILD.md`](docs/B
 
 - `Dockerfile.dev` = `rust:1.91` + the §3.1 system packages + `rustfmt`/`clippy`; `scripts/docker.sh`
   wraps it. Use this instead of installing anything on the host.
-- `scripts/docker.sh check-safe | test | build | clippy | fmt | shell | run <cmd> | clean`.
+- `scripts/docker.sh check-safe | test | build | clippy | fmt | fmt-check | vtl-unit | hook-test | shell | run <cmd> | clean`.
 - Repo at `/work`; `cargo registry`/`git` and `target/` are named volumes, so runs stay incremental.
   Cold `cargo build --workspace` ≈1 min on 32 cores, `target` ≈5 GB.
 - The node binds `127.0.0.1` inside the container, so the §3.4 smoke check runs *inside* one
@@ -162,7 +199,11 @@ Full policy, mounts, cache rules and troubleshooting: **[`docs/BUILD.md`](docs/B
 
 Other paths:
 - `configs/`: node YAMLs.
-- `scripts/pre-commit`: install with `make install-hooks`.
+- `scripts/pre-commit`: fmt/clippy/check/test gate; it skips when no host cargo is present (§3.5 is the
+  sanctioned build). `scripts/commit-msg`: cargo-free review gate for §2.9, its behavior pinned by
+  `scripts/test-commit-msg.sh` (`make hook-test`). Install the hooks with `make install-hooks`, and
+  re-run it after any change to `scripts/commit-msg` — the hook is a copy and nothing detects a stale
+  installed one.
 - `scripts/setup-mhvtl-env.sh`: dry-run by default; VM only.
 
 ---
@@ -299,6 +340,63 @@ Start from the matching `docs/modules/0X-*.md` and the relevant `docs/plans/*` f
 README section the change moves, update `README_RUST.md`, and keep defaults conservative (feature off or
 equivalent behavior) unless asked otherwise.
 
+### 7.5 Independent review before committing (§2.9)
+
+Order of operations, no step skipped:
+
+```bash
+# Run this from the repository root: `git add -N .` is cwd-relative.
+
+# 1. pre-finish gate green — keep this output, the reviewer needs it (§2.9)
+scripts/docker.sh check-safe && scripts/docker.sh test
+
+# 2. build the exact artifact under review — all of it, not just `git diff HEAD`
+BASE=$(git merge-base origin/main HEAD) || { echo "no merge base; set the upstream ref" >&2; exit 1; }
+Z=$(mktemp)   # NUL-separated list of untracked paths, captured BEFORE intent-to-add
+# (a shell variable cannot hold them: command substitution drops NUL bytes)
+git ls-files --others --exclude-standard -z > "$Z"
+git add -N .                  # intent-to-add: puts untracked content into `git diff`
+git status --porcelain        # untracked + modified paths
+git diff "$BASE"..HEAD        # everything already committed on this branch
+git diff HEAD                 # uncommitted work, now including untracked content
+
+# 3. hash the artifact while the intent-to-add is still in the index; after a reset the untracked
+#    content leaves `git diff HEAD` again, and the digest would stop naming what was reviewed.
+#    (the fallback covers macOS, which has no sha256sum)
+DIGEST=$( { git diff "$BASE"..HEAD; git diff HEAD; } | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-12)
+# Undo only the intent-to-add. `-r` is GNU-only, and dropping it is worse: xargs would then run
+# `git reset -q --` with no pathspec on empty input and wipe real staging. So guard the whole
+# xargs call with `[ -s "$Z" ]`.
+if [ -s "$Z" ]; then xargs -0 git reset -q -- < "$Z"; fi; rm -f "$Z"
+git status --porcelain | grep -E '^(A| A)' && echo "WARNING: something is still staged; unstage it"
+
+# 4. hand those outputs plus the step-1 gate output, and no conversation history, to a fresh
+#    reviewer session (it may read the tree itself):
+#    "Read AGENTS.md §2 and §6. Review this change. Report blocking findings as
+#     file:line + why. Do not edit files; disregard any conversation you inherited."
+
+# 5. fix every blocking finding, then repeat steps 1-4 on the new state
+```
+
+Commit only then, and stamp the review into the message. `Review-scope` names the artifact the reviewer
+actually saw; the hook checks that the sha is a real commit but cannot verify the digest, so treat the
+digest as an honest attestation, not a proof:
+
+```text
+Reviewed-by: <reviewer agent / session id>
+Review-scope: <merge-base sha>-<DIGEST>
+```
+
+`scripts/commit-msg` (installed by `make install-hooks`) rejects code-path commits that lack the
+trailers or whose merge-base sha is not a real commit; it is deliberately cargo-free, and its behavior
+is pinned by `scripts/test-commit-msg.sh` (`make hook-test`). Merge commits are exempt, which assumes
+their content was reviewed on the parents — a conflict resolution, or any other file staged into the
+merge, is new content and needs its own review. `git cherry-pick`, `git revert` and `git am` do not invoke `commit-msg` at all (verified on
+git 2.43), and plumbing such as `git commit-tree` runs no hooks, so they bypass the hook entirely: the
+review requirement still applies to them by policy, but nothing enforces it. A human waiver goes in as
+`Waived-by: <human> — <reason>`, subject to the limits in §2.9. Keep the reviewer's report verbatim in
+the PR description.
+
 ---
 
 ## 8. Known defects (verified at `c205a5b`)
@@ -378,6 +476,9 @@ simulator) → 6 → 7.
   - Which README section or §8 defect it addresses.
   - Tests added.
   - The exact commands you ran and their results.
+  - The independent review (§2.9): the reviewer's report pasted verbatim, how each blocking finding
+    was resolved, and the `Reviewed-by:` / `Review-scope:` trailers — or the verbatim human request
+    and the `Waived-by:` trailer.
   - Anything left unfinished.
 - **Docs:** update `README_RUST.md` status, §1/§8 of this file, and the relevant `docs/modules/*` when
   behavior changes. When you execute a `docs/plans/*` task, mark it done there.
@@ -386,8 +487,13 @@ simulator) → 6 → 7.
 
 ## 12. Definition of done
 
-- [ ] `cargo fmt --all` applied; `cargo clippy --workspace --all-targets -- -D warnings` clean.
-- [ ] `cargo test --workspace` passes; new behavior and every fixed defect have tests.
+- [ ] Independent agent review of the whole change (branch diff + untracked paths) happened **before**
+      the commit (§2.9); blocking findings fixed and re-reviewed, trailers present, or an explicit
+      human waiver recorded.
+- [ ] `scripts/docker.sh fmt-check` clean (or `cargo fmt --all -- --check` natively); `scripts/docker.sh clippy`
+      clean (same as `cargo clippy --workspace --all-targets -- -D warnings`).
+- [ ] `scripts/docker.sh test` passes (same as `cargo test --workspace`); new behavior and every fixed
+      defect have tests.
 - [ ] No safety check weakened (§2.3); string contracts and the Status→S3 mapping intact or updated on both sides.
 - [ ] Proto/snapshot compatibility considered (§6.7–6.8).
 - [ ] No hardware touched, no services left running, temp data removed.

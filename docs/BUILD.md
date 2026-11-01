@@ -77,13 +77,14 @@ GitHub `ubuntu-latest` runners preinstall it; it is now listed explicitly in
 ### 3.2 Commands
 
 ```bash
-scripts/docker.sh check-safe   # fmt-check → clippy -D warnings → unit → vtl-unit → build
+scripts/docker.sh check-safe   # fmt-check → clippy -D warnings → unit → vtl-unit → build → hook-test
 scripts/docker.sh test         # cargo test --workspace
 scripts/docker.sh build        # cargo build --workspace
 scripts/docker.sh clippy       # cargo clippy --workspace --all-targets -- -D warnings
 scripts/docker.sh fmt          # cargo fmt --all
 scripts/docker.sh fmt-check    # cargo fmt --all -- --check
 scripts/docker.sh vtl-unit     # cargo test -p coldstore-vtl --lib --tests
+scripts/docker.sh hook-test    # behavior of the scripts/commit-msg review gate (git + bash only)
 scripts/docker.sh shell        # bash in the image, /work = repo
 scripts/docker.sh run <cmd>    # anything else, e.g. run cargo tree -p coldstore-tape
 scripts/docker.sh clean        # docker volume rm coldstore-target
@@ -131,7 +132,7 @@ throwaway directory under `/tmp`.
 Same commands as CI, via the `Makefile`:
 
 ```bash
-make check-safe     # fmt-check, clippy, unit, vtl-unit, build-debug  ← pre-finish gate
+make check-safe     # fmt-check, clippy, unit, vtl-unit, build-debug, hook-test  ← pre-finish gate
 make check-all      # fmt-check, clippy, test
 make vtl-unit
 cargo test -p coldstore-scheduler archive_staging_batch   # one test
@@ -144,7 +145,8 @@ packages — install those manually or use the container.
 
 ## 5. Definition of done (build side)
 
-Run the same gate CI runs (`.github/workflows/rust.yml`: fmt check → clippy → build → test):
+Run the same gate CI runs (`.github/workflows/rust.yml`: fmt check → clippy → build → test →
+`scripts/test-commit-msg.sh`):
 
 ```bash
 scripts/docker.sh check-safe    # fast gate
@@ -156,6 +158,7 @@ scripts/docker.sh test          # full suite, 116 tests
 - [ ] `cargo build --workspace` succeeds.
 - [ ] `cargo test --workspace` passes (116 tests at the time of writing); new behavior and every
       fixed defect have tests.
+- [ ] `scripts/test-commit-msg.sh` passes (the commit-msg review gate; needs git + bash only).
 - [ ] No dependency added or bumped without justification in the PR (`AGENTS.md` §2.5).
 - [ ] No host modifications, no services left running, temp data removed.
 

@@ -80,13 +80,14 @@
 ### 3.2 Команды
 
 ```bash
-scripts/docker.sh check-safe   # fmt-check → clippy -D warnings → unit → vtl-unit → build
+scripts/docker.sh check-safe   # fmt-check → clippy -D warnings → unit → vtl-unit → build → hook-test
 scripts/docker.sh test         # cargo test --workspace
 scripts/docker.sh build        # cargo build --workspace
 scripts/docker.sh clippy       # cargo clippy --workspace --all-targets -- -D warnings
 scripts/docker.sh fmt          # cargo fmt --all
 scripts/docker.sh fmt-check    # cargo fmt --all -- --check
 scripts/docker.sh vtl-unit     # cargo test -p coldstore-vtl --lib --tests
+scripts/docker.sh hook-test    # поведение гейта ревью scripts/commit-msg (нужны только git + bash)
 scripts/docker.sh shell        # bash в образе, /work = репозиторий
 scripts/docker.sh run <cmd>    # что угодно, напр. run cargo tree -p coldstore-tape
 scripts/docker.sh clean        # docker volume rm coldstore-target
@@ -134,7 +135,7 @@ PUT bucket → PUT object → `COLD` → GET 403 → restore 202 → GET, бай
 Те же команды, что и в CI, через `Makefile`:
 
 ```bash
-make check-safe     # fmt-check, clippy, unit, vtl-unit, build-debug  ← гейт перед завершением
+make check-safe     # fmt-check, clippy, unit, vtl-unit, build-debug, hook-test  ← гейт перед завершением
 make check-all      # fmt-check, clippy, test
 make vtl-unit
 cargo test -p coldstore-scheduler archive_staging_batch   # один тест
@@ -147,7 +148,8 @@ cargo test -p coldstore-scheduler archive_staging_batch   # один тест
 
 ## 5. Критерий готовности (часть про сборку)
 
-Прогоняйте тот же гейт, что и CI (`.github/workflows/rust.yml`: fmt check → clippy → build → test):
+Прогоняйте тот же гейт, что и CI (`.github/workflows/rust.yml`: fmt check → clippy → build → test →
+`scripts/test-commit-msg.sh`):
 
 ```bash
 scripts/docker.sh check-safe    # быстрый гейт
@@ -159,6 +161,7 @@ scripts/docker.sh test          # полный набор, 116 тестов
 - [ ] `cargo build --workspace` успешно.
 - [ ] `cargo test --workspace` проходит (на момент написания — 116 тестов); новое поведение и каждая
       исправленная ошибка покрыты тестами.
+- [ ] `scripts/test-commit-msg.sh` проходит (гейт ревью commit-msg; нужны только git + bash).
 - [ ] Ни одной добавленной или поднятой зависимости без обоснования в PR (`AGENTS.md` §2.5).
 - [ ] Хост не изменён, сервисы не оставлены запущенными, временные данные удалены.
 
