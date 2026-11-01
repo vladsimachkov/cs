@@ -9,6 +9,7 @@
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | 当前代码基线的组件、职责、联动关系、一致性边界 |
 | [DESIGN.md](./DESIGN.md) | 较完整的历史设计文档，包含目标态说明，部分内容可能超前于当前实现 |
 | [plans/](./plans/) | 阶段性实施计划与演进记录 |
+| [BUILD.md](./BUILD.md) | 构建、静态检查与测试规则：工具链、系统依赖、Docker 流程、完成标准、故障排查（[俄语](./BUILD.ru.md)） |
 
 ## 模块设计文档
 
