@@ -1,0 +1,408 @@
+# AGENTS.md — ColdStore
+
+Operating manual for AI coding agents (Codex, Claude Code, Cursor, Copilot, Hermes, …) and for humans
+working in this repository. Read it fully before changing code.
+
+Last verified against commit `c205a5b` ("Harden cold archive consistency (#8)"): workspace builds,
+`cargo test --workspace` passes (116 tests), and the e2e smoke flow in §3.4 was run by hand.
+If you change anything this file states as fact, update this file in the same PR.
+
+---
+
+## 1. Read this first: vision vs. reality
+
+`README.md` / `README_ZH.md` describe the **target product** (S3-compatible tape HSM with LTO-9/10,
+Raft metadata, bundle aggregation, dual copy / EC, offline-tape workflows, ≥300 MB/s).
+`README_RUST.md` describes the **current code** and is authoritative for status.
+`docs/` (ARCHITECTURE, DESIGN, modules/01–09) is design intent, not implementation.
+
+**Never assume a README feature exists. Grep for it.** What actually exists today:
+
+| Capability | State | Where |
+|---|---|---|
+| S3 path-style: bucket CRUD, Put/Get/Head/Delete object, ListObjects **v1**, single `Range`, `If-Match`/`If-None-Match`/`If-(Un)Modified-Since`, `POST ?restore`, `x-amz-restore` | ✅ | `crates/gateway/src/handler.rs`, `protocol.rs` |
+| SigV4 auth, multipart upload, ListObjectsV2, virtual-host style, `x-amz-meta-*`, `aws-chunked` decoding, CopyObject, versioning | ❌ absent (no auth at all: every request is accepted) | — |
+| PUT → cache staging → background archive to tape → `COLD` | ✅ but **1 object = 1 bundle = 1 filemark**, single tape and drive from config | `scheduler/src/service.rs::archive_staging_batch` |
+| Bundle aggregation, dual-tape copy, EC | ❌ (`tape_set` field and aggregation config exist, unused) | — |
+| Restore queue: sort tier → tape → offset, SHA-256 verify, write to restored cache with TTL | ✅ | `recall_pending_batch`, `process_recall_task` |
+| Offline-tape notification, operator confirmation API, merge by `archive_id` | ❌ (only `Unavailable` → `WaitingForMedia` → retry next tick) | — |
+| Cache: HDD backend, LRU/LFU, TTL, staging/restored budgets, watermarks, index rebuild on restart | ✅ most mature part | `crates/cache/src/service.rs`, `hdd.rs` |
+| SPDK cache backend | ⚠️ facade that delegates to the HDD backend | `crates/cache/src/spdk.rs` |
+| Tape worker | ⚠️ **in-memory simulator only, not persistent** | `crates/tape/src/service.rs::SimulatorTapeBackend` |
+| Real drives / LTFS / SCSI / LTO-9/10 | ❌; `coldstore-vtl` has mhVTL command builders (`mtx`, `mt`, `sg_*`, `dd`) not wired into `TapeService` | `crates/vtl/` |
+| Metadata | ⚠️ single node: in-memory state machine + snapshot + local RocksDB log. OpenRaft is **not running** (only `BasicNode` type is used); multi-node configs are rejected at startup | `crates/metadata/src/` |
+| Metrics, WORM/retention, admin console, notifications | ❌ (logs via `tracing` only) | — |
+
+---
+
+## 2. Hard rules
+
+1. **Never touch real hardware.** Do not run `scripts/setup-mhvtl-env.sh --execute`, and do not run
+   `mtx`, `mt`, `sg_*`, `dd`, or `vtlcmd` against `/dev/st*`, `/dev/nst*`, `/dev/sg*`, `/dev/sch*`.
+   `coldstore_vtl::command::SystemCommandRunner` is for a dedicated VM and only on explicit human request.
+   In tests use `SimulatorTapeBackend` or `RecordedCommandRunner`.
+2. **Don't leave services running.** Start `coldstore-node` only when an e2e check is needed. Use a
+   throwaway `COLDSTORE_DATA_DIR` under `/tmp`, then stop the process and delete the directory.
+   The standalone binaries default to `/var/lib/coldstore/...`; don't run them as root to "make it work".
+3. **Don't weaken safety checks to make tests pass.** This covers SHA-256 verification, size checks,
+   `expected_*` CAS preconditions in `CompleteArchiveObject`, and `validate_restore_transition`.
+   A failing test means the logic is wrong.
+4. **Don't silently break string contracts** (§6.5). They are parsed across crate boundaries.
+5. **Don't edit generated code.** Change `crates/proto/proto/*.proto`; `tonic-build` regenerates on build.
+6. **Don't add or bump dependencies casually.** `openraft = "0.10.0-alpha.18"` is a pre-release pin,
+   `rocksdb` compiles C++ for minutes, and `Cargo.lock` is git-ignored (§3.1). Justify every new
+   dependency in the PR.
+7. **Don't claim features.** When you implement a README capability, update the table in
+   `README_RUST.md` (and §1 here) in the same PR. When you can't finish one, say so in the PR.
+8. Tests must not use the network beyond loopback and must not need root, devices, or external services.
+
+---
+
+## 3. Environment and commands
+
+### 3.1 Toolchain
+
+- **Rust:** stable. Verified with 1.91. The "1.75+" in `README_RUST.md` is outdated; current
+  dependency versions need a newer compiler. Edition 2021, no `rust-toolchain` file.
+- **System packages:** `protobuf-compiler` (protoc), `libprotobuf-dev` (ships
+  `/usr/include/google/protobuf/*.proto`; without it prost cannot resolve
+  `google/protobuf/timestamp.proto` and `coldstore-proto` fails to build), `clang`,
+  `libclang-dev`, `llvm-dev` (RocksDB via bindgen).
+- **Build rules:** full build/test/lint policy in [`docs/BUILD.md`](docs/BUILD.md)
+  (Russian: [`docs/BUILD.ru.md`](docs/BUILD.ru.md)). §3.5 is the short version.
+- **Components:** `rustfmt`, `clippy`.
+- **First build is slow.** RocksDB is compiled from C++ source (≈10–30 min on a small machine).
+  Incremental builds are fast afterwards. Don't `cargo clean` without reason.
+- **`Cargo.lock` is in `.gitignore`.** Versions float on every fresh resolve. If a clean build breaks
+  without your change, suspect upstream drift first (openraft alpha especially) and say so in the PR.
+  Don't start committing the lock file unless maintainers ask.
+
+### 3.2 Everyday commands
+
+| Purpose | Command |
+|---|---|
+| Format | `cargo fmt --all` |
+| Lint (same as CI) | `cargo clippy --workspace --all-targets -- -D warnings` |
+| All tests | `cargo test --workspace` (116 tests, ~1 s runtime once built) |
+| One crate / one test | `cargo test -p coldstore-scheduler archive_staging_batch` |
+| VTL harness only | `make vtl-unit` |
+| Default pre-finish gate | `make check-safe` (fmt-check, clippy, unit, vtl-unit, build-debug) |
+| What CI runs | fmt check → clippy → `cargo build --workspace` → `cargo test --workspace` (`.github/workflows/rust.yml`) |
+
+Tests spin up in-process tonic servers on `127.0.0.1:0` and use temp dirs. They need nothing external.
+
+### 3.3 Running
+
+Use the all-in-one runtime. It is the only binary that reads a config file:
+
+```bash
+COLDSTORE_DATA_DIR=/tmp/cs cargo run -p coldstore-node                  # with simulated tape
+cargo run -p coldstore-node -- --config configs/single-node-no-tape.yaml # no tape: archive/recall off
+# env: COLDSTORE_CONFIG=<yaml>, COLDSTORE_DATA_DIR=<dir>, COLDSTORE_NO_TAPE=1 (or --no-tape)
+```
+
+Fixed ports in `crates/node/src/main.rs`:
+
+| Component | Address |
+|---|---|
+| S3 gateway | `127.0.0.1:9000` |
+| metadata | `:21001` |
+| scheduler | `:22001` |
+| cache | `:23001` |
+| tape | `:24001` |
+
+The node sets the archive and recall scan intervals to 2 s.
+
+The standalone `coldstore-{metadata,gateway,scheduler,cache,tape}` binaries ignore config files
+(`Config::default()`, see the `TODO` in `metadata/src/main.rs`).
+
+### 3.4 E2E smoke check (verified)
+
+```bash
+GW=http://127.0.0.1:9000
+curl -X PUT $GW/bkt                                                # 200
+curl -X PUT --data-binary @small.bin $GW/bkt/obj                   # 200; must be < 2 MiB, see §8
+sleep 5; curl $GW/bkt | grep -o '<StorageClass>[^<]*'              # COLD (was COLD_PENDING)
+curl -i $GW/bkt/obj                                                # 403 InvalidObjectState
+curl -X POST "$GW/bkt/obj?restore" -d '<RestoreRequest><Days>1</Days></RestoreRequest>'  # 202
+sleep 5; curl -o out.bin $GW/bkt/obj && cmp small.bin out.bin      # 200, identical
+```
+
+The gateway does not verify signatures, so any S3 client works with dummy credentials and
+path-style addressing.
+
+### 3.5 Containerized build and test (Docker)
+
+Full policy, mounts, cache rules and troubleshooting: **[`docs/BUILD.md`](docs/BUILD.md)**
+(`docs/BUILD.ru.md` in Russian). Short version:
+
+- `Dockerfile.dev` = `rust:1.91` + the §3.1 system packages + `rustfmt`/`clippy`; `scripts/docker.sh`
+  wraps it. Use this instead of installing anything on the host.
+- `scripts/docker.sh check-safe | test | build | clippy | fmt | shell | run <cmd> | clean`.
+- Repo at `/work`; `cargo registry`/`git` and `target/` are named volumes, so runs stay incremental.
+  Cold `cargo build --workspace` ≈1 min on 32 cores, `target` ≈5 GB.
+- The node binds `127.0.0.1` inside the container, so the §3.4 smoke check runs *inside* one
+  container. Verified: PUT bucket/object → `COLD` → GET 403 → restore 202 → GET bytes identical.
+
+---
+
+## 4. Repository map
+
+| Crate | Kind | Role | Key files |
+|---|---|---|---|
+| `coldstore-proto` | lib | gRPC/protobuf contracts | `proto/{common,metadata,scheduler,cache,tape}.proto`, `build.rs` |
+| `coldstore-common` | lib | config structs and defaults, shared models/errors | `src/config.rs`, `models.rs`, `error.rs` |
+| `coldstore-gateway` | bin+lib | S3 HTTP (axum 0.7) → scheduler gRPC | `handler.rs` (routes, Range, preconditions, Status→S3 mapping), `protocol.rs` (restore XML, error codes), `lib.rs` (`GatewayBackend`, gRPC client) |
+| `coldstore-scheduler` | bin+lib | business core: S3 ops, archive loop, recall loop | `service.rs` (~4.4k lines, ~45% tests) |
+| `coldstore-metadata` | bin+lib | metadata state and persistence | `state_machine.rs` (**all mutations**), `command.rs`, `service.rs` (gRPC), `raft.rs`, `raft_storage.rs` (RocksDB) |
+| `coldstore-cache` | bin+lib | staging + restored cache | `service.rs` (budgets, eviction, TTL), `hdd.rs`, `backend.rs`, `spdk.rs` |
+| `coldstore-tape` | bin+lib | `TapeService` over the `TapeBackend` trait | `service.rs` (simulator backend), `tests/simulator_service.rs` |
+| `coldstore-vtl` | lib | virtual library model, mhVTL/SCSI command builders, `lsscsi` parser | `simulator.rs`, `mhvtl.rs`, `command.rs`, `discover.rs`, `README.md` |
+| `coldstore-node` | bin | single-process runtime running all components | `src/main.rs` |
+
+Other paths:
+- `configs/`: node YAMLs.
+- `scripts/pre-commit`: install with `make install-hooks`.
+- `scripts/setup-mhvtl-env.sh`: dry-run by default; VM only.
+
+---
+
+## 5. Data flow (where the code lives)
+
+**PutObject**
+1. `gateway::handler::put_object` buffers the body.
+2. `scheduler` `MetadataBackedSchedulerBackend::put_object` computes SHA-256 (also used as the ETag).
+3. Cache `put_staging` stores the bytes.
+4. Metadata `PutObject` records the object with `COLD_PENDING`. If the metadata write fails, staging is
+   deleted best-effort.
+
+**Archive** (`run_archive_agent` → `archive_staging_once` → `archive_staging_batch`):
+1. List staging keys and acquire the in-process item lock.
+2. `head_object`, then claim the archive task.
+3. `get_staging` and validate it against metadata.
+4. `tape.write_bundle` (acquire drive, load tape).
+5. Re-read metadata and require that it is unchanged.
+6. `CompleteArchiveObject`, a CAS on `expected_size/checksum/storage_class/updated_at` that sets `COLD`
+   and stores the bundle.
+7. `delete_staging`, then finalize the task.
+
+**Ordering is a safety invariant:** staging is deleted only after the metadata commit.
+
+**RestoreObject** (`restore_object`):
+- Only allowed for `COLD`.
+- `Expedited` → `Unavailable`.
+- Already `Completed` → 200; already in flight → 409.
+- Otherwise: set restore status to `Pending` and put a `RecallTask` → 202.
+
+**Recall** (`run_recall_agent` → `recall_pending_batch` → `process_recall_task`):
+1. Sort tasks, take the tape lease, claim the task.
+2. Read by filemark.
+3. Verify size and SHA-256.
+4. Cache `put_restored` with `expire_at`.
+5. Task and object restore status → `Completed`.
+
+Retriable errors (`Unavailable`, capacity rejects) move the task to `WaitingForMedia`. All other
+errors → `Failed`.
+
+**GetObject**
+- Requires `COLD` and restore status `Completed`. Otherwise `FailedPrecondition`, which becomes
+  S3 `InvalidObjectState` (403).
+- Reads the full object from the restored cache. `Range` is sliced in the gateway after the full read.
+
+**DeleteObject**
+- Removes metadata and any cached copy, best-effort.
+- Tape space is never reclaimed.
+
+---
+
+## 6. Invariants and conventions you must preserve
+
+1. **Single mutation path.** Every metadata change is a `MetadataCommand` variant applied by
+   `state_machine::apply_command`. `service.rs` must not mutate `MetadataState` directly.
+2. **State transitions are validated centrally.**
+   - Restore: `validate_restore_transition`.
+   - Archive completion: `validate_complete_archive_preconditions`.
+   - Extend these functions and their tests rather than bypassing them.
+3. **Integrity.**
+   - The checksum is the hex SHA-256 of the whole object, and it doubles as the ETag.
+   - It is verified when staging is read for archive and after every tape read.
+   - Byte counts are checked at every hop (`write.bytes_written`, cache size vs metadata size).
+4. **Locks and leases** live in `SchedulerState`: archive item keys, recall task keys, the per-tape
+   lease semaphore, and concurrency slots. Every early return must release what it acquired; follow the
+   existing pattern, which releases explicitly on each error branch.
+5. **String contracts across crates.** Change both sides plus tests, or don't change them.
+   - `capacity_reject:<reason>:<detail>` is emitted by cache (`capacity_reject_error`). The scheduler
+     (`capacity_reject_reason`, `is_retriable_recall_processing_error`) and the gateway
+     (`cache_reject_status_hint`) match on the reason codes.
+   - The gateway matches the message `glacier expedited retrieval is not available` to produce
+     `GlacierExpeditedRetrievalNotAvailable`.
+6. **gRPC `Status` codes are API.** The gateway maps them in `grpc_status_to_s3_response`:
+
+   | `Status` | S3 error | HTTP |
+   |---|---|---|
+   | `NotFound` | NoSuchKey / NoSuchBucket | 404 |
+   | `FailedPrecondition` | InvalidObjectState | 403 |
+   | `AlreadyExists` | RestoreAlreadyInProgress | 409 |
+   | `ResourceExhausted` | SlowDown + `Retry-After` | 503 |
+   | `Unavailable` | ServiceUnavailable | 503 |
+   | `InvalidArgument` | — | 400 |
+   | `Unimplemented` | NotImplemented | 501 |
+
+   Choose codes for what the S3 client should see.
+7. **Snapshot format.**
+   - `state_machine.rs` encodes sections with prost and starts with `SNAPSHOT_MAGIC = "COLDMETA2\n"`.
+   - Adding proto fields is fine.
+   - Changing the section layout requires a new magic plus a decoder for the old format, with a test.
+8. **Proto evolution.** Never reuse or renumber field tags. After editing a `.proto`, the compiler
+   shows every impl to update: gateway backend, scheduler service, and the mocks in tests.
+9. **`phase1_*` naming marks Phase-1 shortcuts** (deterministic IDs, single tape/drive). Don't build new
+   long-lived APIs on them; if you replace one, remove the shortcut instead of layering on it.
+
+---
+
+## 7. Recipes
+
+### 7.1 Add or extend an S3 operation
+
+1. Add the route in `gateway::handler::build_router` and the handler fn.
+2. Add the method to the `GatewayBackend` trait, `GrpcGatewayBackend`, and `MockGatewayBackend` (tests).
+3. Add the rpc to `scheduler.proto`.
+4. Implement it in `SchedulerService`, the `Phase1SchedulerBackend` trait, and
+   `MetadataBackedSchedulerBackend`.
+5. Tests:
+   - Gateway: router-level, via `test_router(state())` with the mock.
+   - Scheduler: with the `metadata_backed_service()` / `cache_backed_service()` helpers.
+
+### 7.2 Add a metadata mutation
+
+1. Add the proto request if needed.
+2. Add the `MetadataCommand` variant.
+3. Add the `apply_command` arm with validation.
+4. Add the gRPC handler in `metadata/src/service.rs` that proposes the command.
+5. Add tests in `state_machine.rs` (pure) and `service.rs` (through gRPC), including a restart test if
+   persistence is affected.
+
+### 7.3 Add a real tape backend
+
+1. Implement the `TapeBackend` trait (`crates/tape/src/service.rs`). Its methods are **synchronous**,
+   so wrap blocking device I/O accordingly.
+2. Make backend selection config-driven. `TapeServiceImpl::new` currently hardcodes `SimulatorTapeBackend`.
+3. Build commands with `coldstore_vtl::mhvtl::MhvtlToolchain` and run them through a `CommandRunner`.
+4. Track the next filemark **per tape, persistently**. The simulator tracks it per drive, in RAM.
+5. Tests:
+   - Unit tests use `RecordedCommandRunner`.
+   - Live tests go behind `#[ignore]` plus an env var and run only in a dedicated mhVTL VM.
+
+### 7.4 Implement a README capability
+
+Start from the matching `docs/modules/0X-*.md` and the relevant `docs/plans/*` file. Write down which
+README section the change moves, update `README_RUST.md`, and keep defaults conservative (feature off or
+equivalent behavior) unless asked otherwise.
+
+---
+
+## 8. Known defects (verified at `c205a5b`)
+
+Treat these as facts when designing changes. Fixing one requires a regression test that fails first.
+
+| # | Defect | Evidence | Pointer |
+|---|---|---|---|
+| 1 | PUT > 2 MiB returns **413** "length limit exceeded": axum's default `DefaultBodyLimit` is not overridden; bodies are fully buffered | e2e | `gateway/src/handler.rs::build_router` |
+| 2 | **Overwriting an archived key leaves it `COLD_PENDING` forever.** The bundle/task IDs `phase1-bundle:{bucket}/{key}` are deterministic, the old task is `Completed`, so claim returns `false`; `CompleteArchiveObject` would also reject the reused bundle ID | e2e | `phase1_bundle_id`, `claim_archive_task` |
+| 3 | **Archived data is lost on restart.** The simulator tape lives in RAM, staging is deleted after archive, metadata persists. Restore then fails, and failed restores cannot be retried ("cannot reopen expired or failed restores") | e2e | `SimulatorTapeBackend`, `restore_object` |
+| 4 | **Restore expiry is a dead end.** Nothing ever sets `RestoreExpired`. After TTL the cache drops the data, metadata still says `Completed`, GET → 403, RestoreObject → 200 "already done" | code | `restore_object`, `read_restored_object` |
+| 5 | `ArchiveTaskFailed` / `RestoreFailed` are never retried; `InProgress` has no lease timeout, so a crash mid-task strands it | code | `claim_archive_task`, `claim_recall_task` |
+| 6 | Metadata "raft log" is effectively write-only (see breakdown below) | code | `raft_storage.rs`, `raft.rs::propose_local_apply` |
+| 7 | Whole objects are held in memory in gateway, scheduler, tape and cache paths; `Range` is applied after the full read | code | `gateway/src/lib.rs`, `handler.rs::get_object` |
+| 8 | Single tape and drive from config; tape full → every later archive task fails. The next filemark is tracked per drive, not per tape | code | `archive_staging_once`, `SimulatorState` |
+| 9 | Config fields declared but never read: `min/max_archive_size_mb`, `target_throughput_mbps`, `aggregation_window_secs`, `write_buffer_mb`, `merge_window_secs`, `restore_timeout_secs`, `read_buffer_mb`, `tape_hold_secs` | grep | `common/src/config.rs` |
+| 10 | Standalone binaries ignore config files; worker register/heartbeat RPCs exist but no worker calls them | code | `*/src/main.rs`, `metadata.proto` |
+
+Breakdown of #6:
+- Log entries are stored as `format!("{command:?}")`, which cannot be replayed.
+- `log_entry_count` scans the whole log on every write.
+- The full snapshot is rewritten on every mutation.
+- The service applies to in-memory state *before* persisting, so a persist error diverges memory from disk.
+- The log entry is appended *before* the command is validated.
+
+Suggested fix order for a usable single node: 1 → 2 → 4 → 5 → 3 (persistent tape or file-backed
+simulator) → 6 → 7.
+
+---
+
+## 9. Testing conventions
+
+- **Where tests go:** unit tests in `#[cfg(test)] mod tests` at the bottom of the same file;
+  integration tests in `crates/<crate>/tests/`.
+- **Reuse existing helpers:**
+  - Scheduler: `metadata_backed_service()`, `cache_backed_service()`, `tape_backed_service()`,
+    `seed_object_metadata()`, `read_staging_object()`.
+  - Gateway: `MockGatewayBackend` + `test_router(state())`.
+  - Tape: the simulator service tests.
+- **Test background work directly.** Call `archive_staging_batch`, `recall_pending_batch`,
+  `archive_staging_once` or `recall_pending_once` instead of spawning the loops and sleeping.
+  No timing-based assertions.
+- **Isolation:** bind `127.0.0.1:0`, use unique temp dirs (`std::env::temp_dir()` + uuid), clean up.
+- **Concurrency changes** need a contention test in the style of `concurrent_claim_recall_task_has_single_winner`.
+- **Persistence changes** need a restart test: write, drop the service, reopen, assert.
+- **Hardware or live tests** are `#[ignore]`d and env-gated; they never run in CI.
+
+---
+
+## 10. Code style
+
+- `rustfmt` defaults; `clippy -D warnings` must be clean.
+- **Error types:**
+  - `tonic::Status` across service boundaries.
+  - `anyhow` in `run()` and binaries.
+  - `thiserror` in `coldstore-vtl`.
+  - `#![allow(clippy::result_large_err)]` is accepted in files returning `Status`.
+- **No `unwrap`/`expect` on request paths.** Map to a meaningful `Status` instead.
+- **Logging:** `tracing` with structured fields; no `println!`.
+- **Language:**
+  - Identifiers, error messages, log messages and new comments: English.
+  - Existing Chinese comments/docs stay as they are unless you rewrite that code; don't mass-translate.
+- **File size:** `scheduler/src/service.rs` is already ~4.4k lines. Put new subsystems in new modules
+  (e.g. `scheduler/src/archive.rs`). Move existing code only in a dedicated refactor PR without
+  behavior changes.
+
+---
+
+## 11. Git and PRs
+
+- **Commit prefixes:** history uses `feat:`, `refactor:`, `doc:`; also use `fix:`, `test:`, `chore:`.
+  PRs are squash-merged into `main` as `Title (#N)`.
+- **One concern per PR.** Refactors and behavior changes go in separate PRs.
+- **PR description must include:**
+  - What changed.
+  - Which README section or §8 defect it addresses.
+  - Tests added.
+  - The exact commands you ran and their results.
+  - Anything left unfinished.
+- **Docs:** update `README_RUST.md` status, §1/§8 of this file, and the relevant `docs/modules/*` when
+  behavior changes. When you execute a `docs/plans/*` task, mark it done there.
+
+---
+
+## 12. Definition of done
+
+- [ ] `cargo fmt --all` applied; `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- [ ] `cargo test --workspace` passes; new behavior and every fixed defect have tests.
+- [ ] No safety check weakened (§2.3); string contracts and the Status→S3 mapping intact or updated on both sides.
+- [ ] Proto/snapshot compatibility considered (§6.7–6.8).
+- [ ] No hardware touched, no services left running, temp data removed.
+- [ ] `README_RUST.md` and this file reflect the new reality.
+
+---
+
+## 13. Doc map
+
+| File | Trust level |
+|---|---|
+| `README_RUST.md` | Current status (authoritative, keep updated) |
+| `AGENTS.md` (this file) | Verified operating facts and known defects |
+| [`docs/BUILD.md`](docs/BUILD.md) / `docs/BUILD.ru.md` | Build, lint and test rules: toolchain, system packages, Docker workflow, definition of done, troubleshooting |
+| `README.md`, `README_ZH.md` | Product vision / requirements |
+| `docs/ARCHITECTURE.md`, `docs/DESIGN.md`, `docs/modules/01–09` | Target design per layer |
+| `docs/plans/*` | Phase plans (Phase 1 done; 2A single-node persistence in progress; 2B = real OpenRaft cluster, not started) |
+| `crates/vtl/README.md` | VTL harness scope and live-mhVTL safety boundary |
