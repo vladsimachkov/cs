@@ -1,3 +1,7 @@
+// This crate maps gRPC failures onto S3 responses, so its handlers and backend return
+// `tonic::Status` everywhere; the type is too large to shrink from our side.
+#![allow(clippy::result_large_err)]
+
 pub mod handler;
 pub mod protocol;
 

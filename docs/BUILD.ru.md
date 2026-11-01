@@ -27,6 +27,19 @@
 - Стабильный тулчейн. Проверено на **1.91**; «1.75+» в `README_RUST.md` устарело — текущие версии
   зависимостей требуют более свежего компилятора. Edition 2021, файла `rust-toolchain` нет.
 - Компоненты: `rustfmt`, `clippy`.
+- Образ фиксирует тулчейн (`ARG RUST_VERSION`, по умолчанию 1.91). Чтобы проверить workspace на
+  более свежем stable до того, как на него перейдёт CI:
+
+  ```bash
+  docker build -f Dockerfile.dev --build-arg RUST_VERSION=1.99 -t coldstore-dev:1.99 .
+  docker run --rm -v "$PWD:/work" -v coldstore-cargo-registry:/usr/local/cargo/registry \
+      -v coldstore-cargo-git:/usr/local/cargo/git -v coldstore-target-199:/work/target \
+      coldstore-dev:1.99 cargo clippy --workspace --all-targets -- -D warnings
+  ```
+
+  Для каждой тулчейн-версии держите отдельный volume для `target`, иначе переключение сбрасывает
+  артефакты другой версии. Обратите внимание: `bash -lc` внутри образа сбрасывает `PATH` и прячет
+  `cargo`; используйте `bash -c`.
 
 ### 2.2 Системные пакеты (имена Debian/Ubuntu)
 
@@ -161,6 +174,7 @@ scripts/docker.sh test          # полный набор, 116 тестов
 | Чистая сборка падает без локальных изменений | `Cargo.lock` в git-ignored → свежий резолв подтянул новую версию апстрима, особенно alpha `openraft`. Закрепите локально и сообщите; молча коммитить lock-файл нельзя. |
 | Cargo висит: `waiting for file lock on package cache` | Другой cargo (обычно второй контейнер) держит общий volume. Остановите его. |
 | Сборка сильно замедлилась / `target` раздут | `docker volume rm coldstore-target` (`scripts/docker.sh clean`) и пересборка. |
+| Clippy чист локально, но падает в CI | CI ставит `stable`, который «плывёт»; контейнер закреплен на 1.91. Воспроизведите через `--build-arg RUST_VERSION=<версия CI>` (§2.1) и чините, а не отключайте линт оптом. Так исправлено для rustc 1.99: `result_large_err` на `tonic::Status` (allow на уровне crate, `AGENTS.md` §10) и `useless_borrows_in_formatting` в `scheduler/src/lib.rs`. |
 
 ---
 

@@ -1,3 +1,7 @@
+// The scheduler is a gRPC service and a gRPC client, so its functions return
+// `tonic::Status`, which is large enough to trip `clippy::result_large_err`.
+#![allow(clippy::result_large_err)]
+
 pub mod service;
 
 use anyhow::{anyhow, Result};
@@ -28,7 +32,7 @@ pub struct SchedulerState {
 pub async fn run(config: SchedulerConfig) -> Result<()> {
     let addr = config.listen.parse()?;
 
-    let metadata_addr = format!("http://{}", &config.metadata_addrs[0]);
+    let metadata_addr = format!("http://{}", config.metadata_addrs[0]);
     let metadata = connect_metadata_with_retry(metadata_addr).await?;
     let cache_addr = config
         .cache_addrs

@@ -27,6 +27,18 @@ Use the container. If a native build is impossible, say so in the PR instead of 
 - Stable toolchain. Verified with **1.91**; the "1.75+" in `README_RUST.md` is stale — current
   dependency versions need a newer compiler. Edition 2021, no `rust-toolchain` file.
 - Components: `rustfmt`, `clippy`.
+- The dev image pins the toolchain (`ARG RUST_VERSION`, default 1.91). To check the workspace
+  against a newer stable before CI floats to it:
+
+  ```bash
+  docker build -f Dockerfile.dev --build-arg RUST_VERSION=1.99 -t coldstore-dev:1.99 .
+  docker run --rm -v "$PWD:/work" -v coldstore-cargo-registry:/usr/local/cargo/registry \
+      -v coldstore-cargo-git:/usr/local/cargo/git -v coldstore-target-199:/work/target \
+      coldstore-dev:1.99 cargo clippy --workspace --all-targets -- -D warnings
+  ```
+
+  Use a separate `target` volume per toolchain, otherwise each switch invalidates the other's
+  artifacts. Note `bash -lc` inside the image resets `PATH` and hides `cargo`; use `bash -c`.
 
 ### 2.2 System packages (Debian/Ubuntu names)
 
@@ -159,6 +171,7 @@ scripts/docker.sh test          # full suite, 116 tests
 | Build fails on a clean checkout with no local change | `Cargo.lock` is ignored → fresh resolve picked up a new upstream version, `openraft` alpha especially. Pin locally, report it; do not commit the lock file silently. |
 | Cargo hangs with `waiting for file lock on package cache` | Another cargo (usually a second container) holds the shared volume. Stop it. |
 | Build got much slower / `target` huge | `docker volume rm coldstore-target` (`scripts/docker.sh clean`) and rebuild. |
+| Clippy is clean locally but fails in CI | CI installs `stable`, which floats; the container pins 1.91. Reproduce with `--build-arg RUST_VERSION=<ci version>` (§2.1) and fix, do not disable the lint wholesale. Fixed this way for rustc 1.99: `result_large_err` on `tonic::Status` (crate-wide allow, `AGENTS.md` §10) and `useless_borrows_in_formatting` in `scheduler/src/lib.rs`. |
 
 ---
 

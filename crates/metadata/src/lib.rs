@@ -1,3 +1,7 @@
+// Metadata mutations and the Raft proposal path return `tonic::Status`, which is large
+// enough to trip `clippy::result_large_err`; it cannot be shrunk from our side.
+#![allow(clippy::result_large_err)]
+
 pub mod command;
 pub mod service;
 pub mod state_machine;

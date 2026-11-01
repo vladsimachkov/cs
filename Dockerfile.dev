@@ -13,7 +13,10 @@
 # /usr/local/cargo — the rustup shims for cargo/rustc live in /usr/local/cargo/bin.
 #
 # See scripts/docker.sh for ready-made wrappers.
-FROM rust:1.91
+# RUST_VERSION keeps the container pinned while GitHub Actions (if ever re-enabled)
+# would otherwise float to whatever `stable` is. See docs/BUILD.md §2.1.
+ARG RUST_VERSION=1.91
+FROM rust:${RUST_VERSION}
 
 # protobuf-compiler -> tonic-build; libprotobuf-dev ships /usr/include/google/protobuf/*.proto,
 # which prost needs to resolve `google/protobuf/timestamp.proto` (protobuf-compiler alone does not
