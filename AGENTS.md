@@ -3,8 +3,8 @@
 Operating manual for AI coding agents (Codex, Claude Code, Cursor, Copilot, Hermes, …) and for humans
 working in this repository. Read it fully before changing code.
 
-Last verified against commit `cc1a5db` plus the PL-06a working state (committed `Cargo.lock`, pinned
-toolchain): the workspace builds, `cargo test --workspace` passes (116 tests), and the e2e smoke flow in §3.4 was run by hand.
+Last verified against commit `bf50b7e` plus this change: the workspace builds, `cargo test
+--workspace` passes (117 tests), and the e2e smoke flow in §3.4 was run by hand.
 If you change anything this file states as fact, update this file in the same PR.
 
 ---
@@ -132,7 +132,7 @@ Raft metadata, bundle aggregation, dual copy / EC, offline-tape workflows, ≥30
 |---|---|
 | Format | `cargo fmt --all` |
 | Lint (same as CI) | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
-| All tests | `cargo test --workspace` (116 tests, ~1 s runtime once built) |
+| All tests | `cargo test --workspace` (117 tests, ~1 s runtime once built) |
 | One crate / one test | `cargo test -p coldstore-scheduler archive_staging_batch` |
 | VTL harness only | `make vtl-unit` |
 | Default pre-finish gate | `make check-safe` (fmt-check, clippy, `metadata-locked`, unit, vtl-unit, build-debug, hook-test) |
@@ -412,7 +412,7 @@ the PR description.
 
 ---
 
-## 8. Known defects (verified at `c205a5b`)
+## 8. Known defects (rows 1–10 verified at `c205a5b`; row 11 at `bf50b7e`)
 
 Treat these as facts when designing changes. Fixing one requires a regression test that fails first.
 
@@ -428,7 +428,7 @@ Treat these as facts when designing changes. Fixing one requires a regression te
 | 8 | Single tape and drive from config; tape full → every later archive task fails. The next filemark is tracked per drive, not per tape | code | `archive_staging_once`, `SimulatorState` |
 | 9 | Config fields declared but never read: `min/max_archive_size_mb`, `target_throughput_mbps`, `aggregation_window_secs`, `write_buffer_mb`, `merge_window_secs`, `restore_timeout_secs`, `read_buffer_mb`, `tape_hold_secs` | grep | `common/src/config.rs` |
 | 10 | Standalone binaries ignore config files; worker register/heartbeat RPCs exist but no worker calls them | code | `*/src/main.rs`, `metadata.proto` |
-| 11 | **Cache unit tests can share a temp dir and collide.** `test_config()` names `/tmp/coldstore-cache-test-<n>` from `SystemTime::now().as_nanos()`, which is not unique under concurrency. Two services then share one `meta/`: `discover_next_id` hands out duplicate ids, and a sibling's `delete()` removes the shared `meta/<id>.json`, so the next `delete()`/`read()` on that id fails in `read_xattrs` with ENOENT (its own `remove_file` calls ignore errors). Observed once (`restored_eviction_prefers_lfu`, "restore b: No such file or directory"), with three clean 116/116 reruns. Violates §9 (unique temp dirs); `uuid` is already a cache dependency, so the fix is one line | test run + code | `cache/src/service.rs` `test_config`, `cache/src/hdd.rs` `discover_next_id`, `delete` |
+| 11 | **Cache object ids are allocated per backend instance (and therefore per process), so two instances pointed at one `meta/` hand out duplicates.** `discover_next_id` scans `meta/` and returns `max_id + 1` with no cross-process lock; allocation within one instance is atomic, and the single-node design runs one cache backend instance per configured path, so this is a deployment constraint rather than a live bug — but nothing enforces it | code | `cache/src/hdd.rs` `discover_next_id`, called once from `HddBackend::new` |
 
 Breakdown of #6:
 - Log entries are stored as `format!("{command:?}")`, which cannot be replayed.

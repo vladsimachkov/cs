@@ -1207,15 +1207,40 @@ fn internal_status(err: anyhow::Error) -> Status {
 mod tests {
     use super::*;
     use coldstore_proto::cache::ContainsRequest;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio_stream::StreamExt;
     use tonic::Code;
 
+    /// Two tests must never share a cache directory. Naming the path from
+    /// `SystemTime::now().as_nanos()` did not guarantee that: two threads asking at the
+    /// same instant got the same path, shared one `meta/`, and then a sibling's `delete()`
+    /// removed the `meta/<id>.json` the other one was about to read.
+    #[test]
+    fn test_config_never_reuses_a_temp_dir() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let path = match test_config().backend {
+                CacheBackendConfig::Hdd { path, .. } => path,
+                CacheBackendConfig::Spdk { .. } => panic!("test_config() must use the hdd backend"),
+            };
+            assert!(
+                seen.insert(path.clone()),
+                "test_config() handed out the same temp dir twice: {path}"
+            );
+            // Pin the mechanism, not just the outcome: a clock reading can collide between
+            // two threads that read it at the same instant, so the name must be a uuid.
+            let name = path.rsplit('/').next().unwrap();
+            let suffix = name
+                .strip_prefix("coldstore-cache-test-")
+                .expect("unexpected cache test dir prefix");
+            uuid::Uuid::parse_str(suffix)
+                .expect("the cache test temp dir must be named by a uuid, not a clock reading");
+        }
+    }
+
     fn test_config() -> CacheConfig {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
+        // A uuid, not a timestamp: two tests running in parallel can read the clock at the
+        // same instant, and then both services share one meta/ directory.
+        let unique = uuid::Uuid::new_v4();
         CacheConfig {
             backend: CacheBackendConfig::Hdd {
                 path: format!("/tmp/coldstore-cache-test-{unique}"),

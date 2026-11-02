@@ -171,13 +171,13 @@ cargo test -p coldstore-scheduler archive_staging_batch   # один тест
 
 ```bash
 scripts/docker.sh check-safe    # быстрый гейт
-scripts/docker.sh test          # полный набор, 116 тестов
+scripts/docker.sh test          # полный набор, 117 тестов
 ```
 
 - [ ] `cargo fmt --all -- --check` чисто.
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` чисто.
 - [ ] `cargo build --workspace` успешно.
-- [ ] `cargo test --workspace` проходит (на момент написания — 116 тестов); новое поведение и каждая
+- [ ] `cargo test --workspace` проходит (на момент написания — 117 тестов); новое поведение и каждая
       исправленная ошибка покрыты тестами.
 - [ ] `cargo metadata --locked` проходит; либо этот PR сам пересоздаёт `Cargo.lock`, и эта
       пересборка входит в просмотренный дифф.

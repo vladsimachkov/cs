@@ -36,7 +36,6 @@ use coldstore_tape::service::{SimulatorTapeBackend, TapeServiceImpl as TapeWorke
 use prost_types::Timestamp;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, Mutex, Semaphore};
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
@@ -343,10 +342,9 @@ pub(crate) async fn metadata_backed_service() -> (
 }
 
 fn test_cache_config() -> CacheConfig {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time")
-        .as_nanos();
+    // A uuid, not a timestamp: two tests running in parallel can read the clock at the same
+    // instant, and then both services share one meta/ directory.
+    let unique = uuid::Uuid::new_v4();
     CacheConfig {
         backend: CacheBackendConfig::Hdd {
             path: format!("/tmp/coldstore-scheduler-cache-test-{unique}"),

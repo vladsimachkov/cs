@@ -254,6 +254,21 @@ ack → data is still archived from the survivor and re-replicated.
 
 ---
 
+## Test hygiene follow-ups
+
+Small, known, and deliberately left out of the defect-#11 fix (which was a one-line
+naming change) so that PR stayed a single concern:
+
+- `cache/src/service.rs::test_config` and `scheduler/src/test_util.rs::test_cache_config`
+  are the same helper duplicated across two crates. Collapse them into one shared
+  test helper; that also pins the uuid naming in one place instead of guarding each
+  copy (only the cache copy is pinned today).
+- Both helpers write under a literal `/tmp/` and never remove the directory they
+  create. §9 asks for `std::env::temp_dir()` and cleanup; `metadata/src/raft_storage.rs`
+  already shows the pattern.
+
+---
+
 ## Definition of done for cache
 
 - [ ] Crash-safety suite: no partial or orphan state after any crash point.
