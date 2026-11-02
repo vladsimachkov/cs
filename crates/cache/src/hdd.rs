@@ -1,8 +1,9 @@
-use crate::backend::{CacheBackend, CacheCategory, CacheXattrs};
+use crate::backend::{CacheBackend, CacheCategory, CacheXattrs, StreamWrite};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::fs;
+use tokio::fs::{self, OpenOptions};
+use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
 pub struct HddBackend {
@@ -35,6 +36,12 @@ impl HddBackend {
 
     fn meta_path(&self, id: u64) -> PathBuf {
         self.base_path.join("meta").join(format!("{id}.json"))
+    }
+
+    /// The temp path a streaming write for `id` accumulates into. Shares the object's
+    /// directory so the commit is a same-filesystem rename, never a copy.
+    fn temp_path(&self, id: u64, cat: CacheCategory) -> PathBuf {
+        self.data_path(id, cat).with_extension("part")
     }
 }
 
@@ -103,6 +110,57 @@ impl CacheBackend for HddBackend {
         fs::write(self.meta_path(id), serde_json::to_vec(&to_json(xattrs))?).await?;
         debug!(id, size = data.len(), "HDD write ok");
         Ok(id)
+    }
+
+    async fn begin_stream(&self, category: CacheCategory) -> Result<StreamWrite> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let temp_path = self.temp_path(id, category);
+        // Create it now so a later append failure means "the object exists and is short",
+        // not "the object never existed".
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
+            .await?;
+        debug!(id, ?temp_path, "HDD stream begin");
+        Ok(StreamWrite {
+            storage_id: id,
+            temp_path,
+        })
+    }
+
+    async fn append_stream(&self, write: &StreamWrite, data: &[u8]) -> Result<()> {
+        // O_APPEND per chunk: one open per chunk, which at 1 MiB chunks is noise next to
+        // the write itself, and it means no file handle is held across await points in the
+        // caller's loop.
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&write.temp_path)
+            .await?;
+        file.write_all(data).await?;
+        file.flush().await?;
+        Ok(())
+    }
+
+    async fn commit_stream(&self, write: &StreamWrite, xattrs: &CacheXattrs) -> Result<u64> {
+        let id = write.storage_id;
+        // Data first, then xattrs. A crash in between leaks one orphan `.dat` (readers
+        // enumerate `meta/`, so it is invisible and merely wastes space); the reverse
+        // order would publish a `meta/` entry whose data file is missing, which reads
+        // as a corrupt object.
+        fs::rename(&write.temp_path, self.data_path(id, xattrs.category)).await?;
+        fs::write(self.meta_path(id), serde_json::to_vec(&to_json(xattrs))?).await?;
+        debug!(id, size = xattrs.size, "HDD stream commit");
+        Ok(id)
+    }
+
+    async fn abort_stream(&self, write: &StreamWrite) -> Result<()> {
+        match fs::remove_file(&write.temp_path).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 
     async fn read(&self, id: u64) -> Result<Vec<u8>> {

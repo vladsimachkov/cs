@@ -13,7 +13,9 @@ use crate::service::{ArchiveBatchResult, MetadataBackedSchedulerBackend, Phase1S
 use crate::util::*;
 use crate::SchedulerState;
 use coldstore_proto::cache::put_staging_request::Payload as PutStagingPayload;
-use coldstore_proto::cache::{DeleteStagingRequest, PutStagingMeta, PutStagingRequest};
+use coldstore_proto::cache::{
+    DeleteStagingRequest, PutStagingMeta, PutStagingRequest, PutStagingTrailer,
+};
 use coldstore_proto::common;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
@@ -42,23 +44,35 @@ impl MetadataBackedSchedulerBackend {
     ) -> std::result::Result<String, Status> {
         let mut client = self.cache_client()?;
         let size = staging.data.len() as u64;
+        let checksum = staging.checksum.clone();
+        let mut chunks = vec![
+            PutStagingRequest {
+                payload: Some(PutStagingPayload::Meta(PutStagingMeta {
+                    bucket: staging.bucket,
+                    key: staging.key,
+                    version_id: staging.version_id,
+                    size,
+                    checksum: Some(staging.checksum),
+                    content_type: staging.content_type,
+                    etag: Some(staging.etag),
+                })),
+            },
+            PutStagingRequest {
+                payload: Some(PutStagingPayload::Data(staging.data)),
+            },
+        ];
+        // The body is already hashed here to make the ETag, so declaring that digest
+        // costs nothing and moves a corrupt staging write from archive time, when the
+        // archiver reads the bundle back, to the PUT that caused it.
+        if !checksum.is_empty() {
+            chunks.push(PutStagingRequest {
+                payload: Some(PutStagingPayload::Trailer(PutStagingTrailer {
+                    sha256: checksum,
+                })),
+            });
+        }
         Ok(client
-            .put_staging(Request::new(tokio_stream::iter(vec![
-                PutStagingRequest {
-                    payload: Some(PutStagingPayload::Meta(PutStagingMeta {
-                        bucket: staging.bucket,
-                        key: staging.key,
-                        version_id: staging.version_id,
-                        size,
-                        checksum: Some(staging.checksum),
-                        content_type: staging.content_type,
-                        etag: Some(staging.etag),
-                    })),
-                },
-                PutStagingRequest {
-                    payload: Some(PutStagingPayload::Data(staging.data)),
-                },
-            ])))
+            .put_staging(Request::new(tokio_stream::iter(chunks)))
             .await?
             .into_inner()
             .staging_id)
@@ -476,13 +490,10 @@ fn validate_staged_object_matches_metadata(
     Ok(())
 }
 
+/// The shared rule lives in `coldstore-common` so the cache's staging-trailer check and
+/// this archive-time check cannot drift apart (AGENTS.md 6.5).
 fn checksum_matches(expected: &str, computed_hex: &str) -> bool {
-    let expected = expected.trim();
-    let expected = expected
-        .strip_prefix("sha256:")
-        .or_else(|| expected.strip_prefix("SHA256:"))
-        .unwrap_or(expected);
-    expected.eq_ignore_ascii_case(computed_hex)
+    coldstore_common::checksum::sha256_matches(expected, computed_hex)
 }
 
 pub(crate) async fn run_archive_agent(state: Arc<SchedulerState>, agent_id: u64) {

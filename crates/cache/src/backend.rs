@@ -1,4 +1,18 @@
 use anyhow::Result;
+use std::path::PathBuf;
+
+/// An in-progress streaming write.
+///
+/// The bytes live at `temp_path`, outside the published object namespace, and become
+/// visible to readers only when [`CacheBackend::commit_stream`] renames them into
+/// place. A stream that is never committed leaves at most the temp file behind, which
+/// [`CacheBackend::abort_stream`] removes.
+pub struct StreamWrite {
+    /// The storage id the object will get if the stream is committed.
+    pub storage_id: u64,
+    /// Where the bytes are accumulating. Not readable as an object until commit.
+    pub temp_path: PathBuf,
+}
 
 /// 缓存后端抽象 trait
 ///
@@ -6,8 +20,26 @@ use anyhow::Result;
 /// 目标实现: SpdkBlobBackend (SPDK Blobstore on NVMe)
 #[tonic::async_trait]
 pub trait CacheBackend: Send + Sync + 'static {
-    /// 写入对象数据，返回内部存储 ID
+    /// Write a whole object in one call and return its internal storage ID.
+    ///
+    /// Buffers the full object; prefer the streaming methods for anything that
+    /// arrives in pieces, since they hold at most one chunk in memory.
     async fn write(&self, cache_key: &str, data: &[u8], xattrs: &CacheXattrs) -> Result<u64>;
+
+    /// Start a streaming write: allocate a storage id and a temp file for it.
+    ///
+    /// The caller must end the stream with exactly one of `commit_stream` or
+    /// `abort_stream`; an abandoned stream leaks a temp file.
+    async fn begin_stream(&self, category: CacheCategory) -> Result<StreamWrite>;
+
+    /// Append one chunk to an in-progress stream. Memory cost is this chunk only.
+    async fn append_stream(&self, write: &StreamWrite, data: &[u8]) -> Result<()>;
+
+    /// Publish an in-progress stream under its storage id with its xattrs.
+    async fn commit_stream(&self, write: &StreamWrite, xattrs: &CacheXattrs) -> Result<u64>;
+
+    /// Discard an in-progress stream. Idempotent: a missing temp file is not an error.
+    async fn abort_stream(&self, write: &StreamWrite) -> Result<()>;
 
     /// 读取对象数据
     async fn read(&self, storage_id: u64) -> Result<Vec<u8>>;

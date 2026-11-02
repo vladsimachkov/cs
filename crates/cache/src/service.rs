@@ -1,11 +1,13 @@
-use crate::backend::{CacheBackend, CacheCategory, CacheXattrs};
+use crate::backend::{CacheBackend, CacheCategory, CacheXattrs, StreamWrite};
 use crate::hdd::HddBackend;
 use crate::spdk::SpdkBackend;
 use anyhow::Result;
+use coldstore_common::checksum::sha256_matches;
 use coldstore_common::config::{CacheBackendConfig, CacheConfig};
 use coldstore_proto::cache::cache_service_server::CacheService;
 use coldstore_proto::cache::*;
 use prost_types::Timestamp;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -350,40 +352,59 @@ impl CacheServiceImpl {
 
     async fn put_bytes(&self, key: CacheKey, data: Vec<u8>, xattrs: CacheXattrs) -> Result<u64> {
         let guard = self.write_lock.lock().await;
-        self.ensure_object_size_within_total_capacity(xattrs.size)
-            .await?;
-        let existing = self.find_entry(&key, xattrs.category).await;
-        let capacity_delta = xattrs
-            .size
-            .saturating_sub(existing.as_ref().map_or(0, |entry| entry.xattrs.size));
-        let reclaim_skip = if xattrs.category == CacheCategory::Restored {
-            Some(&key)
-        } else {
-            None
-        };
-        self.reclaim_expired_restored_except(reclaim_skip).await?;
-        self.evict_if_needed(capacity_delta, xattrs.category)
+        self.prepare_capacity(&key, xattrs.size, xattrs.category)
             .await?;
         let storage_id = self.backend.write(&key.as_cursor(), &data, &xattrs).await?;
         let previous = self
             .insert_entry(key, StoredEntry { storage_id, xattrs })
-            .await;
+            .await
+            .map(|entry| entry.storage_id);
         drop(guard);
+        self.replace_previous(previous, storage_id).await;
+        Ok(storage_id)
+    }
 
-        if let Some(previous_storage_id) = previous.map(|entry| entry.storage_id) {
-            if previous_storage_id != storage_id {
-                if let Err(err) = self.backend.delete(previous_storage_id).await {
-                    warn!(
-                        previous_storage_id,
-                        new_storage_id = storage_id,
-                        error = %err,
-                        "cache overwrite failed to delete replaced storage object"
-                    );
-                }
+    /// Make room for an object of `size`, evicting if needed.
+    ///
+    /// Shared by the buffered and the streaming write paths so both reserve and
+    /// evict identically; a second copy would drift. The caller must hold
+    /// `write_lock` for the whole write, not just this call.
+    async fn prepare_capacity(
+        &self,
+        key: &CacheKey,
+        size: u64,
+        category: CacheCategory,
+    ) -> Result<()> {
+        self.ensure_object_size_within_total_capacity(size).await?;
+        let existing = self.find_entry(key, category).await;
+        let capacity_delta =
+            size.saturating_sub(existing.as_ref().map_or(0, |entry| entry.xattrs.size));
+        let reclaim_skip = if category == CacheCategory::Restored {
+            Some(key)
+        } else {
+            None
+        };
+        self.reclaim_expired_restored_except(reclaim_skip).await?;
+        self.evict_if_needed(capacity_delta, category).await?;
+        Ok(())
+    }
+
+    /// Drop the storage object an overwrite replaced. Called after `write_lock` is
+    /// released: deleting is best effort and must not hold up the next writer.
+    async fn replace_previous(&self, previous: Option<u64>, storage_id: u64) {
+        let Some(previous_storage_id) = previous else {
+            return;
+        };
+        if previous_storage_id != storage_id {
+            if let Err(err) = self.backend.delete(previous_storage_id).await {
+                warn!(
+                    previous_storage_id,
+                    new_storage_id = storage_id,
+                    error = %err,
+                    "cache overwrite failed to delete replaced storage object"
+                );
             }
         }
-
-        Ok(storage_id)
     }
 
     async fn ensure_object_size_within_total_capacity(&self, object_size: u64) -> Result<()> {
@@ -683,6 +704,20 @@ impl CacheServiceImpl {
         self.eviction_batch_size.max(1)
     }
 
+    /// Discard an aborted stream. A failure here is logged, not returned: the caller
+    /// is already reporting the reason the stream was rejected, and a leaked temp file
+    /// is the lesser problem.
+    async fn abort_write(&self, write: &StreamWrite) {
+        if let Err(err) = self.backend.abort_stream(write).await {
+            warn!(
+                storage_id = write.storage_id,
+                temp_path = ?write.temp_path,
+                error = %err,
+                "cache could not discard an aborted staging stream"
+            );
+        }
+    }
+
     fn map_capacity_error(err: anyhow::Error) -> Status {
         let message = err.to_string();
         let message_lc = message.to_lowercase();
@@ -860,23 +895,22 @@ impl CacheService for CacheServiceImpl {
         req: Request<Streaming<PutStagingRequest>>,
     ) -> std::result::Result<Response<PutStagingResponse>, Status> {
         let mut stream = req.into_inner();
-        let mut meta: Option<PutStagingMeta> = None;
-        let mut data = Vec::new();
 
-        while let Some(chunk) = stream.message().await? {
-            match chunk.payload {
-                Some(put_staging_request::Payload::Meta(m)) => meta = Some(m),
-                Some(put_staging_request::Payload::Data(bytes)) => data.extend_from_slice(&bytes),
-                None => return Err(Status::invalid_argument("empty put_staging chunk")),
+        // Metadata first, always: capacity is reserved from the declared size before a
+        // single byte is written, which is what stops an oversized or lying client from
+        // filling the cache.
+        let first = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("empty put_staging stream"))?;
+        let meta = match first.payload {
+            Some(put_staging_request::Payload::Meta(m)) => m,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first put_staging chunk must carry metadata",
+                ))
             }
-        }
-
-        let meta = meta.ok_or_else(|| Status::invalid_argument("missing staging metadata"))?;
-        if meta.size != data.len() as u64 {
-            return Err(Status::invalid_argument(
-                "staging object size does not match payload",
-            ));
-        }
+        };
 
         let key = CacheKey::new(
             meta.bucket.clone(),
@@ -897,13 +931,125 @@ impl CacheService for CacheServiceImpl {
             etag: meta.etag,
             category: CacheCategory::Staging,
         };
-        let storage_id = self
-            .put_bytes(key, data, xattrs)
+
+        // The lock is held for the whole stream, as it is for a buffered put: capacity
+        // accounting and eviction must not interleave with another writer.
+        let guard = self.write_lock.lock().await;
+        self.prepare_capacity(&key, xattrs.size, CacheCategory::Staging)
             .await
             .map_err(CacheServiceImpl::map_capacity_error)?;
 
+        // Bytes accumulate in a temp file, one chunk in memory at a time. Nothing here
+        // is visible to a reader until `commit_stream`, so every early return below
+        // leaves the cache exactly as it found it apart from the temp file, which
+        // `abort_write` removes.
+        let write = self
+            .backend
+            .begin_stream(CacheCategory::Staging)
+            .await
+            .map_err(|err| {
+                Status::internal(format!("cache could not begin staging write: {err}"))
+            })?;
+
+        let mut hasher = Sha256::new();
+        let mut received: u64 = 0;
+        let mut trailer: Option<String> = None;
+        let mut failure: Option<Status> = None;
+
+        while failure.is_none() {
+            let chunk = match stream.message().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(status) => {
+                    failure = Some(status);
+                    break;
+                }
+            };
+            match chunk.payload {
+                Some(put_staging_request::Payload::Data(bytes)) => {
+                    if trailer.is_some() {
+                        failure = Some(Status::invalid_argument(
+                            "put_staging trailer must be the last chunk",
+                        ));
+                    } else {
+                        received += bytes.len() as u64;
+                        hasher.update(&bytes);
+                        // Bound, not just count: the reservation was taken from the
+                        // declared size, so bytes past it are unaccounted for and would
+                        // grow the temp file beyond the space the cache reserved.
+                        if received > xattrs.size {
+                            failure = Some(Status::invalid_argument(
+                                "staging object size does not match payload",
+                            ));
+                        } else if let Err(err) = self.backend.append_stream(&write, &bytes).await {
+                            failure = Some(Status::internal(format!(
+                                "cache could not write staging data: {err}"
+                            )));
+                        }
+                    }
+                }
+                Some(put_staging_request::Payload::Trailer(t)) => {
+                    if trailer.is_some() {
+                        failure = Some(Status::invalid_argument("duplicate put_staging trailer"));
+                    } else {
+                        trailer = Some(t.sha256);
+                    }
+                }
+                Some(put_staging_request::Payload::Meta(_)) => {
+                    failure = Some(Status::invalid_argument(
+                        "put_staging metadata must be the first chunk",
+                    ));
+                }
+                None => failure = Some(Status::invalid_argument("empty put_staging chunk")),
+            }
+        }
+
+        let digest = format!("{:x}", hasher.finalize());
+
+        // A stream that ended early, was malformed, or promised a digest it did not
+        // deliver commits nothing.
+        if let Some(status) = failure {
+            self.abort_write(&write).await;
+            return Err(status);
+        }
+        if received != xattrs.size {
+            self.abort_write(&write).await;
+            return Err(Status::invalid_argument(
+                "staging object size does not match payload",
+            ));
+        }
+        if let Some(expected) = trailer {
+            if !sha256_matches(&expected, &digest) {
+                self.abort_write(&write).await;
+                return Err(Status::invalid_argument(format!(
+                    "staging sha256 does not match trailer: expected {expected}, received {digest}"
+                )));
+            }
+        }
+
+        // If the rename itself failed this is the last place that can remove the temp
+        // file: nothing sweeps `*.part` yet. If the rename succeeded and only the meta
+        // write failed, the data file is already published and abort cannot recover it —
+        // that orphan is CA-02's startup sweep, not this path's.
+        let storage_id = match self.backend.commit_stream(&write, &xattrs).await {
+            Ok(storage_id) => storage_id,
+            Err(err) => {
+                self.abort_write(&write).await;
+                return Err(Status::internal(format!(
+                    "cache could not commit staging write: {err}"
+                )));
+            }
+        };
+        let previous = self
+            .insert_entry(key, StoredEntry { storage_id, xattrs })
+            .await
+            .map(|entry| entry.storage_id);
+        drop(guard);
+        self.replace_previous(previous, storage_id).await;
+
         Ok(Response::new(PutStagingResponse {
             staging_id: storage_id.to_string(),
+            sha256: digest,
         }))
     }
 
@@ -1206,6 +1352,8 @@ fn internal_status(err: anyhow::Error) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coldstore_proto::cache::cache_service_client::CacheServiceClient;
+    use coldstore_proto::cache::cache_service_server::CacheServiceServer;
     use coldstore_proto::cache::ContainsRequest;
     use tokio_stream::StreamExt;
     use tonic::Code;
@@ -1248,6 +1396,410 @@ mod tests {
             },
             ..CacheConfig::default()
         }
+    }
+
+    fn test_cache_dir(config: &CacheConfig) -> String {
+        match &config.backend {
+            CacheBackendConfig::Hdd { path, .. } => path.clone(),
+            CacheBackendConfig::Spdk { .. } => panic!("test_config() must use the hdd backend"),
+        }
+    }
+
+    fn staging_meta(bucket: &str, key: &str, size: u64) -> PutStagingRequest {
+        PutStagingRequest {
+            payload: Some(put_staging_request::Payload::Meta(PutStagingMeta {
+                bucket: bucket.into(),
+                key: key.into(),
+                version_id: None,
+                size,
+                checksum: None,
+                content_type: None,
+                etag: None,
+            })),
+        }
+    }
+
+    fn staging_data(bytes: &[u8]) -> PutStagingRequest {
+        PutStagingRequest {
+            payload: Some(put_staging_request::Payload::Data(bytes.to_vec())),
+        }
+    }
+
+    fn staging_trailer(sha256: &str) -> PutStagingRequest {
+        PutStagingRequest {
+            payload: Some(put_staging_request::Payload::Trailer(PutStagingTrailer {
+                sha256: sha256.into(),
+            })),
+        }
+    }
+
+    fn hex_sha256(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    async fn staging_service() -> (
+        CacheServiceClient<tonic::transport::Channel>,
+        String,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        // Driven over a real in-process gRPC server rather than by calling the trait
+        // impl: `tonic::Streaming` has no public constructor, and the wire path is what
+        // the new trailer message actually travels on.
+        let config = test_config();
+        let dir = test_cache_dir(&config);
+        let svc = CacheServiceImpl::new(&config).await.expect("service init");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(CacheServiceServer::new(svc))
+                .serve_with_shutdown(addr, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("cache server should run");
+        });
+
+        let mut client = None;
+        for _ in 0..20 {
+            match CacheServiceClient::connect(format!("http://{addr}")).await {
+                Ok(connected) => {
+                    client = Some(connected);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+            }
+        }
+        (client.expect("connect cache client"), dir, shutdown_tx)
+    }
+
+    async fn put_staging(
+        client: &mut CacheServiceClient<tonic::transport::Channel>,
+        chunks: Vec<PutStagingRequest>,
+    ) -> std::result::Result<PutStagingResponse, Status> {
+        Ok(client
+            .put_staging(Request::new(tokio_stream::iter(chunks)))
+            .await?
+            .into_inner())
+    }
+
+    async fn staging_dir_files(dir: &str) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut dir = tokio::fs::read_dir(format!("{dir}/staging"))
+            .await
+            .expect("staging dir");
+        while let Some(entry) = dir.next_entry().await.expect("read staging dir") {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        names
+    }
+
+    /// Read a staging object back over gRPC, or `None` when the cache does not have it.
+    ///
+    /// `contains` and `get` only look at the restored category, so a staging object is
+    /// observable through `get_staging` — which also gives the bytes to compare.
+    async fn read_staging(
+        client: &mut CacheServiceClient<tonic::transport::Channel>,
+        key: &str,
+    ) -> Option<Vec<u8>> {
+        let mut stream = client
+            .get_staging(Request::new(GetStagingRequest {
+                bucket: "bkt".into(),
+                key: key.into(),
+                version_id: None,
+            }))
+            .await
+            .ok()?
+            .into_inner();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.message().await.ok()? {
+            if let Some(get_staging_response::Payload::Data(data)) = chunk.payload {
+                bytes.extend_from_slice(&data);
+            }
+        }
+        Some(bytes)
+    }
+
+    #[tokio::test]
+    async fn put_staging_accepts_multiple_chunks_and_reports_the_digest() {
+        let (mut client, _dir, _shutdown) = staging_service().await;
+        let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+
+        let response = put_staging(
+            &mut client,
+            vec![
+                staging_meta("bkt", "multi", body.len() as u64),
+                staging_data(&body[..100_000]),
+                staging_data(&body[100_000..250_000]),
+                staging_data(&body[250_000..]),
+                staging_trailer(&hex_sha256(&body)),
+            ],
+        )
+        .await
+        .expect("streaming put_staging should succeed");
+
+        assert_eq!(response.sha256, hex_sha256(&body));
+        let read = read_staging(&mut client, "multi")
+            .await
+            .expect("the streamed object must be readable from staging");
+        assert_eq!(read, body, "streamed-in bytes must read back intact");
+    }
+
+    #[tokio::test]
+    async fn put_staging_with_a_wrong_trailer_commits_nothing() {
+        let (mut client, dir, _shutdown) = staging_service().await;
+        let body = b"payload the trailer will not match".to_vec();
+
+        let error = put_staging(
+            &mut client,
+            vec![
+                staging_meta("bkt", "bad-trailer", body.len() as u64),
+                staging_data(&body),
+                staging_trailer(&hex_sha256(b"a different payload entirely")),
+            ],
+        )
+        .await
+        .expect_err("a trailer that does not match must be rejected");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("staging sha256 does not match trailer"),
+            "unexpected message: {}",
+            error.message()
+        );
+        assert!(
+            read_staging(&mut client, "bad-trailer").await.is_none(),
+            "a rejected stream must not be readable"
+        );
+        assert!(
+            staging_dir_files(&dir).await.is_empty(),
+            "a rejected stream must leave no data file and no temp file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_staging_with_a_wrong_size_commits_nothing() {
+        let (mut client, dir, _shutdown) = staging_service().await;
+        let body = b"short".to_vec();
+
+        let error = put_staging(
+            &mut client,
+            vec![
+                staging_meta("bkt", "wrong-size", (body.len() + 10) as u64),
+                staging_data(&body),
+            ],
+        )
+        .await
+        .expect_err("a short body must be rejected");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("staging object size does not match payload"),
+            "unexpected message: {}",
+            error.message()
+        );
+        assert!(read_staging(&mut client, "wrong-size").await.is_none());
+        assert!(
+            staging_dir_files(&dir).await.is_empty(),
+            "a rejected stream must leave no data file and no temp file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_staging_without_a_trailer_still_commits() {
+        // A trailer-less stream must keep committing on the declared-size check alone.
+        // No in-tree live path sends this shape any more (the scheduler hashes the body
+        // for the ETag and so always sends a trailer), but the proto keeps it legal, and
+        // a caller that cannot hash the body must not find staging unusable.
+        let (mut client, _dir, _shutdown) = staging_service().await;
+        let body = b"legacy caller".to_vec();
+
+        let response = put_staging(
+            &mut client,
+            vec![
+                staging_meta("bkt", "legacy", body.len() as u64),
+                staging_data(&body),
+            ],
+        )
+        .await
+        .expect("a trailer-less stream must still commit");
+
+        assert_eq!(response.sha256, hex_sha256(&body));
+        assert_eq!(
+            read_staging(&mut client, "legacy").await,
+            Some(body),
+            "a trailer-less object must be stored intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_staging_rejects_data_after_the_trailer() {
+        let (mut client, dir, _shutdown) = staging_service().await;
+        let body = b"abcdef".to_vec();
+
+        let error = put_staging(
+            &mut client,
+            vec![
+                staging_meta("bkt", "after-trailer", body.len() as u64),
+                staging_data(&body),
+                staging_trailer(&hex_sha256(&body)),
+                staging_data(b"more"),
+            ],
+        )
+        .await
+        .expect_err("the trailer is the last message");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error.message().contains("trailer must be the last chunk"),
+            "unexpected message: {}",
+            error.message()
+        );
+        assert!(read_staging(&mut client, "after-trailer").await.is_none());
+        assert!(staging_dir_files(&dir).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_staging_rejects_a_body_longer_than_its_declared_size() {
+        // What this pins is the outcome: an over-long body is refused and nothing is
+        // left behind. It does NOT pin the mid-stream bound in the read loop — a
+        // black-box client cannot observe how large the temp file got before the
+        // stream was rejected, and the end-of-stream size check alone would also
+        // produce this same result.
+        let (mut client, dir, _shutdown) = staging_service().await;
+
+        let error = put_staging(
+            &mut client,
+            vec![
+                staging_meta("bkt", "oversize", 3),
+                staging_data(b"way more than three bytes"),
+            ],
+        )
+        .await
+        .expect_err("a body longer than the declared size must be rejected");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("staging object size does not match payload"),
+            "unexpected message: {}",
+            error.message()
+        );
+        assert!(read_staging(&mut client, "oversize").await.is_none());
+        assert!(
+            staging_dir_files(&dir).await.is_empty(),
+            "the rejected stream must leave no temp file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_staging_accepts_a_prefixed_trailer_digest() {
+        // The archive-side comparison in the scheduler has always tolerated a `sha256:`
+        // prefix and surrounding whitespace. The staging side must agree, or the same
+        // checksum string passes one gate and fails the other.
+        let (mut client, _dir, _shutdown) = staging_service().await;
+        let body = b"prefixed digest".to_vec();
+
+        let response = put_staging(
+            &mut client,
+            vec![
+                staging_meta("bkt", "prefixed", body.len() as u64),
+                staging_data(&body),
+                staging_trailer(&format!(" sha256:{}", hex_sha256(&body).to_uppercase())),
+            ],
+        )
+        .await
+        .expect("a sha256-prefixed digest must be accepted like the archive side accepts it");
+
+        assert_eq!(response.sha256, hex_sha256(&body));
+        assert_eq!(read_staging(&mut client, "prefixed").await, Some(body));
+    }
+
+    #[tokio::test]
+    async fn put_staging_requires_metadata_first() {
+        let (mut client, dir, _shutdown) = staging_service().await;
+
+        let error = put_staging(&mut client, vec![staging_data(b"no metadata")])
+            .await
+            .expect_err("a stream with no leading metadata must be rejected");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("first put_staging chunk must carry metadata"),
+            "unexpected message: {}",
+            error.message()
+        );
+        assert!(staging_dir_files(&dir).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_staging_rejects_a_second_trailer() {
+        let (mut client, dir, _shutdown) = staging_service().await;
+        let body = b"abcdef".to_vec();
+        let digest = hex_sha256(&body);
+
+        let error = put_staging(
+            &mut client,
+            vec![
+                staging_meta("bkt", "late-trailer", body.len() as u64),
+                staging_data(&body),
+                staging_trailer(&digest),
+                staging_trailer(&digest),
+            ],
+        )
+        .await
+        .expect_err("one trailer is the allowance");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error.message().contains("duplicate put_staging trailer"),
+            "unexpected message: {}",
+            error.message()
+        );
+        assert!(read_staging(&mut client, "late-trailer").await.is_none());
+        assert!(staging_dir_files(&dir).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_staging_rejects_a_second_metadata_chunk() {
+        let (mut client, dir, _shutdown) = staging_service().await;
+        let body = b"abcdef".to_vec();
+
+        let error = put_staging(
+            &mut client,
+            vec![
+                staging_meta("bkt", "late-meta", body.len() as u64),
+                staging_data(&body[..3]),
+                staging_meta("bkt", "late-meta", body.len() as u64),
+                staging_data(&body[3..]),
+            ],
+        )
+        .await
+        .expect_err("metadata may only be the first chunk");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("put_staging metadata must be the first chunk"),
+            "unexpected message: {}",
+            error.message()
+        );
+        assert!(read_staging(&mut client, "late-meta").await.is_none());
+        assert!(staging_dir_files(&dir).await.is_empty());
     }
 
     #[tokio::test]

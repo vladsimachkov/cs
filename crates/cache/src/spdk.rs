@@ -1,4 +1,4 @@
-use crate::backend::{CacheBackend, CacheXattrs};
+use crate::backend::{CacheBackend, CacheCategory, CacheXattrs, StreamWrite};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,6 +30,22 @@ impl SpdkBackend {
 impl CacheBackend for SpdkBackend {
     async fn write(&self, cache_key: &str, data: &[u8], xattrs: &CacheXattrs) -> Result<u64> {
         self.inner.write(cache_key, data, xattrs).await
+    }
+
+    async fn begin_stream(&self, category: CacheCategory) -> Result<StreamWrite> {
+        self.inner.begin_stream(category).await
+    }
+
+    async fn append_stream(&self, write: &StreamWrite, data: &[u8]) -> Result<()> {
+        self.inner.append_stream(write, data).await
+    }
+
+    async fn commit_stream(&self, write: &StreamWrite, xattrs: &CacheXattrs) -> Result<u64> {
+        self.inner.commit_stream(write, xattrs).await
+    }
+
+    async fn abort_stream(&self, write: &StreamWrite) -> Result<()> {
+        self.inner.abort_stream(write).await
     }
 
     async fn read(&self, storage_id: u64) -> Result<Vec<u8>> {

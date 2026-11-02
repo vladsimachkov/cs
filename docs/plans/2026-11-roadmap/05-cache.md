@@ -93,15 +93,67 @@ Restored entries use the same protocol without the fsyncs: losing them is harmle
 - Range reads.
 - Trailer mismatch → nothing committed (no file, no index entry).
 
+**Progress — step 1 done:**
+
+- `PutStaging` streams. Capacity is reserved from the declared size before the first byte, chunks
+  are appended to `<id>.part` in the object's own directory, and the commit is a same-directory
+  rename, so a reader never sees a partial object. One chunk is in memory at a time instead of the
+  whole body.
+- `PutStagingTrailer { sha256 }` added to the request oneof, and `sha256` to the response. When a
+  trailer is present the cache commits only after it and only on a match; a mismatch, a short body, a
+  second `meta`, data after the trailer, or a broken stream leaves no data file and no index entry. A
+  stream with no trailer still commits on the declared-size check alone, so the change is additive on
+  the wire.
+- The scheduler now always sends the trailer: it already hashes the body to make the ETag, so
+  declaring that digest costs nothing. A damaged staging write now fails at PUT time instead of when
+  the archiver reads the bundle back. No in-tree **live path** uses the trailer-less shape any more —
+  two scheduler tests still send it, which is exactly why it stays legal and stays tested.
+- Deliberately not in step 1: `object_id` keying (still `(bucket, key, version_id)`), `GetStaging`
+  range reads, streaming `PutRestored`, `CopyStagingToRestored`, the multipart RPCs, the RSS
+  assertion, and **MD5** — the design's trailer and response both name `md5`, and step 1 shipped
+  `sha256` only, because nothing in the tree computes or needs an MD5 today (the ETag is the SHA-256
+  hex, AGENTS.md §6.3) and adding one would mean a new dependency for an unused field. Add it when
+  GW-01 actually needs it. Also not in step 1: reservations — a staging write still holds the global
+  `write_lock` across the stream (AGENTS.md §8 row 12), which is what CA-06's reservations exist to
+  remove.
+- Three deviations from the design as written, all deliberate:
+  - The plan says "new RPC names, keep the old ones for one release". Step 1 extended the existing
+    `PutStaging` in place instead: the change is additive and wire-compatible, the API is internal
+    (no external client speaks `cache.proto`), and a `PutStagingV2` alongside a live `PutStaging`
+    would be a dead RPC rather than a migration aid. **There is no `PutStagingV2`; do not look for
+    one** — later steps extend `PutStaging` the same way.
+  - The plan says `tokio::fs::File` with a 1 MiB `BufWriter`. Step 1 opens the temp file with
+    `O_APPEND` per chunk instead, so no file handle is held across an `await` in the caller's loop;
+    at 1 MiB chunks the extra open is noise next to the write. Memory per stream is one chunk.
+  - The plan's write protocol fsyncs the file and then the parent directory. Step 1 does neither:
+    `flush()` on a `tokio::fs::File` is a no-op and `commit_stream` does not sync the directory, so
+    **staging data is not crash-durable** — a power loss can commit an index entry whose bytes are
+    still in the page cache. Durability is CA-02's subject, so step 1 did not add syncs on its own.
+
 ### CA-02: Durable staging and crash safety `[M0]` `P0` est. 4 d
 
 **Design:** the write protocol above, plus a startup recovery step:
-1. Delete everything in `tmp/`.
+1. Delete in-flight temp files. The target layout puts them in `tmp/`; what CA-01 step 1 actually
+   shipped keeps them beside the objects as `staging/<id>.part`, so name that until `tmp/` exists —
+   otherwise the sweep is written against a directory that is never used. (`restored/<id>.part` does
+   not exist yet: `PutRestored` still buffers, so nothing creates it. It will once restored writes
+   stream.) Two producers leave a `.part` behind: a failed commit rename, and a stream abandoned
+   mid-flight (HTTP/2 connection drop, server shutdown) after the id was allocated — the second is not
+   crash-only and not self-clearing within a process run, so the sweep must run at startup and not
+   only after an unclean exit.
 2. For index entries whose data file is missing → mark them lost and report them (`StagingLost` event via
    the scheduler).
 3. For data files without index entries → move them to `orphans/` and report them. Never auto-delete
-   before the scheduler janitor confirms with metadata (CA-03).
-4. Verify the `VERSION` layout; migrate v1 (`staging/<id>.dat` + `meta/<id>.json`) → v2 with a one-shot
+   before the scheduler janitor confirms with metadata (CA-03). This is also what catches the one crash
+   window CA-01 step 1 leaves behind: `commit_stream` renames the data into place before writing
+   `meta/<id>.json`, so a crash between the two strands one `<id>.dat` with no index entry. The order
+   is deliberate — the reverse publishes an entry whose data file is missing, which reads as a
+   corrupt object — and the leak is bounded at one object per crash and self-clearing, because ids
+   are monotonic and `discover_next_id` returns exactly that id on restart.
+4. Fault-injection tests that CA-01 step 1 could not write: a failing `commit_stream` rename (the
+   abort path has no test today, because inducing it needs a `#[cfg(test)]` backend seam), and a
+   staging stream abandoned mid-flight.
+5. Verify the `VERSION` layout; migrate v1 (`staging/<id>.dat` + `meta/<id>.json`) → v2 with a one-shot
    migrator.
 
 Also:
@@ -176,6 +228,12 @@ one heartbeat.
 **Tests:** demotion/promotion with a virtual clock; O_DIRECT alignment handling for unaligned tails.
 
 ### CA-06: SpaceManager: budgets, reservations, backpressure `[M1]` est. 4 d
+
+**Required by CA-01 step 1:** a staging write reserves from the declared size and evicts to fit
+*before a single byte arrives*, so a stream that declares N and sends nothing can evict up to N bytes
+of other entries and commit nothing (AGENTS.md §8 row 12). Reservations that are released when the
+stream is rejected are what removes that, and they are also what lets the `write_lock` be dropped
+mid-stream.
 
 **Design:**
 - **Budgets:**

@@ -168,13 +168,13 @@ Run the same gate CI runs (`.github/workflows/rust.yml`: toolchain pin + drift c
 
 ```bash
 scripts/docker.sh check-safe    # fast gate
-scripts/docker.sh test          # full suite, 117 tests
+scripts/docker.sh test          # full suite, 130 tests
 ```
 
 - [ ] `cargo fmt --all -- --check` clean.
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean.
 - [ ] `cargo build --workspace` succeeds.
-- [ ] `cargo test --workspace` passes (117 tests at the time of writing); new behavior and every
+- [ ] `cargo test --workspace` passes (130 tests at the time of writing); new behavior and every
       fixed defect have tests.
 - [ ] `cargo metadata --locked` passes, or this change itself regenerates `Cargo.lock` and that
       regeneration is part of the reviewed diff.

@@ -21,6 +21,8 @@ ColdStore 是**纯冷归档系统**（类似 AWS Glacier Deep Archive）：
 
 当前仍不会访问真实磁带设备，也不默认执行集成测试。
 
+Cache 的 staging 写入已改为流式落盘：按声明大小预留容量，逐块写入临时文件，收到 trailer 时仅在 SHA-256 匹配后才提交（不匹配则不留任何文件与索引项）；未发送 trailer 时（例如无法预先计算摘要的调用方）缓存仍在 end-of-stream 声明大小校验通过后提交。scheduler 因计算 ETag 已经算好了摘要，所以实际的 PutObject 路径总会带 trailer。读取路径与 restored 写入仍整体缓冲（CA-01 后续步骤）。
+
 ## Workspace 结构
 
 | Crate | 类型 | 说明 |

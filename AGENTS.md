@@ -3,8 +3,8 @@
 Operating manual for AI coding agents (Codex, Claude Code, Cursor, Copilot, Hermes, …) and for humans
 working in this repository. Read it fully before changing code.
 
-Last verified against commit `bf50b7e` plus this change: the workspace builds, `cargo test
---workspace` passes (117 tests), and the e2e smoke flow in §3.4 was run by hand.
+Last verified against commit `b25fd34` plus this change: the workspace builds, `cargo test
+--workspace` passes (130 tests), and the e2e smoke flow in §3.4 was run by hand.
 If you change anything this file states as fact, update this file in the same PR.
 
 ---
@@ -26,7 +26,7 @@ Raft metadata, bundle aggregation, dual copy / EC, offline-tape workflows, ≥30
 | Bundle aggregation, dual-tape copy, EC | ❌ (`tape_set` field and aggregation config exist, unused) | — |
 | Restore queue: sort tier → tape → offset, SHA-256 verify, write to restored cache with TTL | ✅ | `recall_pending_batch`, `process_recall_task` |
 | Offline-tape notification, operator confirmation API, merge by `archive_id` | ❌ (only `Unavailable` → `WaitingForMedia` → retry next tick) | — |
-| Cache: HDD backend, LRU/LFU, TTL, staging/restored budgets, watermarks, index rebuild on restart | ✅ most mature part | `crates/cache/src/service.rs`, `hdd.rs` |
+| Cache: HDD backend, LRU/LFU, TTL, staging/restored budgets, watermarks, index rebuild on restart | ✅ most mature part. Staging writes stream to disk with an atomic commit and optional SHA-256 trailer (CA-01 step 1); reads and restored writes still buffer | `crates/cache/src/service.rs`, `hdd.rs` |
 | SPDK cache backend | ⚠️ facade that delegates to the HDD backend | `crates/cache/src/spdk.rs` |
 | Tape worker | ⚠️ **in-memory simulator only, not persistent** | `crates/tape/src/service.rs::SimulatorTapeBackend` |
 | Real drives / LTFS / SCSI / LTO-9/10 | ❌; `coldstore-vtl` has mhVTL command builders (`mtx`, `mt`, `sg_*`, `dd`) not wired into `TapeService` | `crates/vtl/` |
@@ -132,7 +132,7 @@ Raft metadata, bundle aggregation, dual copy / EC, offline-tape workflows, ≥30
 |---|---|
 | Format | `cargo fmt --all` |
 | Lint (same as CI) | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
-| All tests | `cargo test --workspace` (117 tests, ~1 s runtime once built) |
+| All tests | `cargo test --workspace` (130 tests, ~1 s runtime once built) |
 | One crate / one test | `cargo test -p coldstore-scheduler archive_staging_batch` |
 | VTL harness only | `make vtl-unit` |
 | Default pre-finish gate | `make check-safe` (fmt-check, clippy, `metadata-locked`, unit, vtl-unit, build-debug, hook-test) |
@@ -201,7 +201,7 @@ Full policy, mounts, cache rules and troubleshooting: **[`docs/BUILD.md`](docs/B
 | Crate | Kind | Role | Key files |
 |---|---|---|---|
 | `coldstore-proto` | lib | gRPC/protobuf contracts | `proto/{common,metadata,scheduler,cache,tape}.proto`, `build.rs` |
-| `coldstore-common` | lib | config structs and defaults, shared models/errors | `src/config.rs`, `models.rs`, `error.rs` |
+| `coldstore-common` | lib | config structs and defaults, shared models/errors, the shared digest rule | `src/config.rs`, `models.rs`, `error.rs`, `checksum.rs` |
 | `coldstore-gateway` | bin+lib | S3 HTTP (axum 0.7) → scheduler gRPC | `router.rs` (route table), `s3/` (one module per operation family: `bucket`, `object`, `list`, `restore`, `range`, `preconditions`, `headers`, `errors`, `xml`), `protocol.rs` (restore XML, error codes), `lib.rs` (`GatewayBackend`, gRPC client) |
 | `coldstore-scheduler` | bin+lib | business core: S3 ops, archive loop, recall loop | `service.rs` (gRPC surface, the `Phase1SchedulerBackend` trait, background loops), `s3_ops.rs` (bucket/object CRUD, restore, restored-cache read), `archive.rs` (staging hand-off, archive task lifecycle, archive loop), `recall.rs` (recall task lifecycle, tape→cache restore, recall loop), `test_util.rs` (shared `#[cfg(test)]` fixtures), `clients/{cache,tape}.rs` (cache/tape traits + gRPC clients), `leases.rs` (item/task locks, tape lease, `capacity_reject` parsing), `responses.rs` (proto response builders), `util.rs` |
 | `coldstore-metadata` | bin+lib | metadata state and persistence | `state_machine.rs` (**all mutations**), `command.rs`, `service.rs` (gRPC), `raft.rs`, `raft_storage.rs` (RocksDB) |
@@ -412,7 +412,7 @@ the PR description.
 
 ---
 
-## 8. Known defects (rows 1–10 verified at `c205a5b`; row 11 at `bf50b7e`)
+## 8. Known defects (rows 1–10 verified at `c205a5b`; rows 11–13 at `b25fd34` or later)
 
 Treat these as facts when designing changes. Fixing one requires a regression test that fails first.
 
@@ -424,11 +424,13 @@ Treat these as facts when designing changes. Fixing one requires a regression te
 | 4 | **Restore expiry is a dead end.** Nothing ever sets `RestoreExpired`. After TTL the cache drops the data, metadata still says `Completed`, GET → 403, RestoreObject → 200 "already done" | code | `restore_object`, `read_restored_object` |
 | 5 | `ArchiveTaskFailed` / `RestoreFailed` are never retried; `InProgress` has no lease timeout, so a crash mid-task strands it | code | `claim_archive_task`, `claim_recall_task` |
 | 6 | Metadata "raft log" is effectively write-only (see breakdown below) | code | `raft_storage.rs`, `raft.rs::propose_local_apply` |
-| 7 | Whole objects are held in memory in gateway, scheduler, tape and cache paths; `Range` is applied after the full read | code | `gateway/src/lib.rs`, `s3/object.rs::get_object` |
+| 7 | Whole objects are held in memory in the gateway, scheduler and tape paths, and in the cache's read and restored-write paths; `Range` is applied after the full read. The staging **write** path streams (CA-01 step 1) | code | `gateway/src/lib.rs`, `s3/object.rs::get_object`, `cache/src/backend.rs::read` |
 | 8 | Single tape and drive from config; tape full → every later archive task fails. The next filemark is tracked per drive, not per tape | code | `archive_staging_once`, `SimulatorState` |
 | 9 | Config fields declared but never read: `min/max_archive_size_mb`, `target_throughput_mbps`, `aggregation_window_secs`, `write_buffer_mb`, `merge_window_secs`, `restore_timeout_secs`, `read_buffer_mb`, `tape_hold_secs` | grep | `common/src/config.rs` |
 | 10 | Standalone binaries ignore config files; worker register/heartbeat RPCs exist but no worker calls them | code | `*/src/main.rs`, `metadata.proto` |
 | 11 | **Cache object ids are allocated per backend instance (and therefore per process), so two instances pointed at one `meta/` hand out duplicates.** `discover_next_id` scans `meta/` and returns `max_id + 1` with no cross-process lock; allocation within one instance is atomic, and the single-node design runs one cache backend instance per configured path, so this is a deployment constraint rather than a live bug — but nothing enforces it | code | `cache/src/hdd.rs` `discover_next_id`, called once from `HddBackend::new` |
+| 12 | **A staging write holds the cache's global `write_lock` for the whole client stream**, so one slow uploader blocks every other cache write, restores included — and nothing bounds how long: the cache server sets no tonic transport/request timeout or deadline (a bare `Server::builder().serve(addr)`; the `*_timeout_secs` config fields that exist are never read — row 9). Capacity is reserved from the declared size before the first byte, which is why the lock is held across the stream; releasing it mid-stream would let another writer take the space. **And because that reservation runs before any byte arrives, eviction runs too: a stream that declares N and sends nothing can still evict up to N bytes of staging and restored entries and then commit nothing** (it was not reachable before, when eviction waited for a verified full body). **Gate: GW-01 must not stream real client bodies into `PutStaging` until CA-06 reservations/backpressure exist or a per-stream deadline is added** — today the only caller is in-process and pushes one in-memory chunk, so this is latent, and GW-01 is exactly what makes it live | code | `cache/src/service.rs::put_staging`, `prepare_capacity`, `cache/src/lib.rs` |
+| 13 | **An abandoned staging stream leaks its `<id>.part` file.** `StreamWrite` has no `Drop`, so only the explicit rejections abort; if the handler future is dropped mid-stream (HTTP/2 disconnect, server shutdown) the temp file survives with up to the declared size, invisible to accounting because `list_all` and `discover_next_id` enumerate `meta/` only. One leak per abandoned stream, for the process lifetime — not crash-only and not self-clearing. CA-02's startup sweep is the fix | code | `cache/src/backend.rs::StreamWrite`, `cache/src/service.rs::put_staging` |
 
 Breakdown of #6:
 - Log entries are stored as `format!("{command:?}")`, which cannot be replayed.

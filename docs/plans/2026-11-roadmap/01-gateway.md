@@ -77,6 +77,15 @@ file set; byte-identical bodies; 35 tests before and after).
 
 ### GW-01: Streaming PutObject; remove the 2 MiB limit `[M0]` `P0` est. 3–4 d
 
+**Precondition (added by CA-01 step 1, AGENTS.md §8 row 12):** do **not** stream a real client body
+into `PutStaging` until CA-06 reservations/backpressure exist or a per-stream deadline is added on
+the cache server. A staging write holds the cache's global `write_lock` for the whole stream and
+nothing bounds it, so one stalled client body freezes every cache write, restores included; and
+capacity is reserved and evicted from the *declared* size before the first byte arrives, so a
+client-controlled declared size can evict other entries and commit nothing. Both are latent today
+because the only caller is in-process and derives the size from bytes it already holds — GW-01 is
+what makes them live.
+
 **Depends on:** CA-01 (streaming staging), CA-02 (durable staging).
 
 **Design:**

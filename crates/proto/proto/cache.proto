@@ -66,7 +66,25 @@ message PutStagingRequest {
   oneof payload {
     PutStagingMeta meta = 1;
     bytes data = 2;
+    // Optional final message. When present the cache commits the object only after
+    // this message and only if sha256 matches the bytes it actually received; a
+    // mismatch leaves nothing behind (no data file, no index entry). It must be the
+    // last message: data after a trailer is rejected. When there is no trailer the
+    // cache commits at end of stream after the declared-size check — the fallback for
+    // a caller that cannot hash the body. The scheduler does hash it (for the ETag),
+    // so the live PutObject path always sends a trailer.
+    PutStagingTrailer trailer = 3;
   }
+}
+
+// Final integrity declaration for a PutStaging stream.
+message PutStagingTrailer {
+  // Hex SHA-256 of every data byte sent in this stream. Surrounding whitespace and an
+  // optional `sha256:` / `SHA256:` prefix are tolerated and hex case does not matter.
+  // The comparison is `coldstore_common::checksum::sha256_matches`, shared with the
+  // scheduler's archive-time check so one `checksum` string cannot pass one gate and
+  // fail the other (AGENTS.md 6.5).
+  string sha256 = 1;
 }
 
 message PutStagingMeta {
@@ -81,6 +99,10 @@ message PutStagingMeta {
 
 message PutStagingResponse {
   string staging_id = 1;
+  // Hex SHA-256 of the bytes the cache actually stored, lowercase. Always computed,
+  // whether or not the caller sent a trailer; a caller that did can compare it
+  // against its own digest without a second read.
+  string sha256 = 2;
 }
 
 // ---------------------------------------------------------------------------
