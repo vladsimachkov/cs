@@ -7,7 +7,7 @@ authenticate requests, and expose Glacier-style restore semantics.
 ## Current state (verified at `c205a5b`)
 
 **What exists:**
-- Axum 0.7 router with path-style routes only (`handler.rs::build_router`): `/`, `/:bucket`,
+- Axum 0.7 router with path-style routes only (`handler.rs::build_router`, pre-GW-00 path; now `router.rs::build_router`): `/`, `/:bucket`,
   `/:bucket/*key`.
 - Bucket CRUD and ListObjects **v1** (marker, prefix, delimiter, max-keys ≤ 1000).
 - Put/Get/Head/Delete object, single `Range`, conditional headers, and `POST ?restore`.
@@ -58,6 +58,13 @@ crates/gateway/src/
 ## Tasks
 
 ### GW-00: Split `handler.rs` into modules (no behavior change) `[M0]` est. 1–2 d
+
+**Status:** ✅ done, with the disclosed layout subset below. Landed as `router.rs` (route table) + `s3/{bucket,object,list,restore,range,preconditions,headers,errors,xml}.rs`, with one
+mock double in `s3/testing.rs` now shared by six per-module test blocks (the old `handler.rs` had one `mod tests` with one mock; it was not duplicated, it was split).
+The `auth/` and `backend/` directories from the layout above belong to GW-04 and GW-10 and are not created here. `handler.rs` remains as a temporary alias.
+Note on the acceptance line "`git diff --stat` shows moves only": git cannot rename-detect a 1→12 file split (11 modules + `mod.rs`), so no `--stat` output could read that way; equivalence
+was checked by other means (all 39 top-level `fn` items from the old file are present, plus the test-only `state()` which moved to top level of `s3/testing.rs` — 40 in the new
+file set; byte-identical bodies; 35 tests before and after).
 
 **Steps:**
 1. Move code into the layout above.

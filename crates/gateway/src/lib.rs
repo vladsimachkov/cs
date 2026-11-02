@@ -4,6 +4,8 @@
 
 pub mod handler;
 pub mod protocol;
+pub mod router;
+pub(crate) mod s3;
 
 use anyhow::Result;
 use coldstore_common::config::GatewayConfig;
@@ -329,7 +331,7 @@ pub async fn run(config: GatewayConfig) -> Result<()> {
         backend: Arc::new(GrpcGatewayBackend::new(scheduler_addrs)),
     });
 
-    let app = handler::router(state);
+    let app = router::router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen).await?;
     info!("S3 Gateway 启动在 {}", config.listen);

@@ -20,7 +20,7 @@ Raft metadata, bundle aggregation, dual copy / EC, offline-tape workflows, ≥30
 
 | Capability | State | Where |
 |---|---|---|
-| S3 path-style: bucket CRUD, Put/Get/Head/Delete object, ListObjects **v1**, single `Range`, `If-Match`/`If-None-Match`/`If-(Un)Modified-Since`, `POST ?restore`, `x-amz-restore` | ✅ | `crates/gateway/src/handler.rs`, `protocol.rs` |
+| S3 path-style: bucket CRUD, Put/Get/Head/Delete object, ListObjects **v1**, single `Range`, `If-Match`/`If-None-Match`/`If-(Un)Modified-Since`, `POST ?restore`, `x-amz-restore` | ✅ | `crates/gateway/src/router.rs`, `s3/*.rs`, `protocol.rs` |
 | SigV4 auth, multipart upload, ListObjectsV2, virtual-host style, `x-amz-meta-*`, `aws-chunked` decoding, CopyObject, versioning | ❌ absent (no auth at all: every request is accepted) | — |
 | PUT → cache staging → background archive to tape → `COLD` | ✅ but **1 object = 1 bundle = 1 filemark**, single tape and drive from config | `scheduler/src/service.rs::archive_staging_batch` |
 | Bundle aggregation, dual-tape copy, EC | ❌ (`tape_set` field and aggregation config exist, unused) | — |
@@ -202,7 +202,7 @@ Full policy, mounts, cache rules and troubleshooting: **[`docs/BUILD.md`](docs/B
 |---|---|---|---|
 | `coldstore-proto` | lib | gRPC/protobuf contracts | `proto/{common,metadata,scheduler,cache,tape}.proto`, `build.rs` |
 | `coldstore-common` | lib | config structs and defaults, shared models/errors | `src/config.rs`, `models.rs`, `error.rs` |
-| `coldstore-gateway` | bin+lib | S3 HTTP (axum 0.7) → scheduler gRPC | `handler.rs` (routes, Range, preconditions, Status→S3 mapping), `protocol.rs` (restore XML, error codes), `lib.rs` (`GatewayBackend`, gRPC client) |
+| `coldstore-gateway` | bin+lib | S3 HTTP (axum 0.7) → scheduler gRPC | `router.rs` (route table), `s3/` (one module per operation family: `bucket`, `object`, `list`, `restore`, `range`, `preconditions`, `headers`, `errors`, `xml`), `protocol.rs` (restore XML, error codes), `lib.rs` (`GatewayBackend`, gRPC client) |
 | `coldstore-scheduler` | bin+lib | business core: S3 ops, archive loop, recall loop | `service.rs` (~4.4k lines, ~45% tests) |
 | `coldstore-metadata` | bin+lib | metadata state and persistence | `state_machine.rs` (**all mutations**), `command.rs`, `service.rs` (gRPC), `raft.rs`, `raft_storage.rs` (RocksDB) |
 | `coldstore-cache` | bin+lib | staging + restored cache | `service.rs` (budgets, eviction, TTL), `hdd.rs`, `backend.rs`, `spdk.rs` |
@@ -224,7 +224,7 @@ Other paths:
 ## 5. Data flow (where the code lives)
 
 **PutObject**
-1. `gateway::handler::put_object` buffers the body.
+1. `gateway::s3::object::put_object` buffers the body.
 2. `scheduler` `MetadataBackedSchedulerBackend::put_object` computes SHA-256 (also used as the ETag).
 3. Cache `put_staging` stores the bytes.
 4. Metadata `PutObject` records the object with `COLD_PENDING`. If the metadata write fails, staging is
@@ -318,7 +318,7 @@ errors → `Failed`.
 
 ### 7.1 Add or extend an S3 operation
 
-1. Add the route in `gateway::handler::build_router` and the handler fn.
+1. Add the route in `gateway::router::build_router` and the handler fn (in the matching `gateway::s3::<family>` module).
 2. Add the method to the `GatewayBackend` trait, `GrpcGatewayBackend`, and `MockGatewayBackend` (tests).
 3. Add the rpc to `scheduler.proto`.
 4. Implement it in `SchedulerService`, the `Phase1SchedulerBackend` trait, and
@@ -418,13 +418,13 @@ Treat these as facts when designing changes. Fixing one requires a regression te
 
 | # | Defect | Evidence | Pointer |
 |---|---|---|---|
-| 1 | PUT > 2 MiB returns **413** "length limit exceeded": axum's default `DefaultBodyLimit` is not overridden; bodies are fully buffered | e2e | `gateway/src/handler.rs::build_router` |
+| 1 | PUT > 2 MiB returns **413** "length limit exceeded": axum's default `DefaultBodyLimit` is not overridden; bodies are fully buffered | e2e | `gateway/src/router.rs::build_router` |
 | 2 | **Overwriting an archived key leaves it `COLD_PENDING` forever.** The bundle/task IDs `phase1-bundle:{bucket}/{key}` are deterministic, the old task is `Completed`, so claim returns `false`; `CompleteArchiveObject` would also reject the reused bundle ID | e2e | `phase1_bundle_id`, `claim_archive_task` |
 | 3 | **Archived data is lost on restart.** The simulator tape lives in RAM, staging is deleted after archive, metadata persists. Restore then fails, and failed restores cannot be retried ("cannot reopen expired or failed restores") | e2e | `SimulatorTapeBackend`, `restore_object` |
 | 4 | **Restore expiry is a dead end.** Nothing ever sets `RestoreExpired`. After TTL the cache drops the data, metadata still says `Completed`, GET → 403, RestoreObject → 200 "already done" | code | `restore_object`, `read_restored_object` |
 | 5 | `ArchiveTaskFailed` / `RestoreFailed` are never retried; `InProgress` has no lease timeout, so a crash mid-task strands it | code | `claim_archive_task`, `claim_recall_task` |
 | 6 | Metadata "raft log" is effectively write-only (see breakdown below) | code | `raft_storage.rs`, `raft.rs::propose_local_apply` |
-| 7 | Whole objects are held in memory in gateway, scheduler, tape and cache paths; `Range` is applied after the full read | code | `gateway/src/lib.rs`, `handler.rs::get_object` |
+| 7 | Whole objects are held in memory in gateway, scheduler, tape and cache paths; `Range` is applied after the full read | code | `gateway/src/lib.rs`, `s3/object.rs::get_object` |
 | 8 | Single tape and drive from config; tape full → every later archive task fails. The next filemark is tracked per drive, not per tape | code | `archive_staging_once`, `SimulatorState` |
 | 9 | Config fields declared but never read: `min/max_archive_size_mb`, `target_throughput_mbps`, `aggregation_window_secs`, `write_buffer_mb`, `merge_window_secs`, `restore_timeout_secs`, `read_buffer_mb`, `tape_hold_secs` | grep | `common/src/config.rs` |
 | 10 | Standalone binaries ignore config files; worker register/heartbeat RPCs exist but no worker calls them | code | `*/src/main.rs`, `metadata.proto` |
