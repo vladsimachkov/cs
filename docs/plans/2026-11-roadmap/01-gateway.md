@@ -103,8 +103,9 @@ file set; byte-identical bodies; 35 tests before and after).
 **Files:**
 - `gateway/src/body.rs` (new) and `s3/object.rs`.
 - `proto/scheduler.proto`: add `PutObjectTrailer`.
-- `scheduler/src/service.rs::put_object` (consume the stream, pass through to cache staging streaming
-  API).
+- `scheduler/src/s3_ops.rs::put_object` (consume the stream, pass through to cache staging streaming
+  API; the staging hop is `scheduler/src/archive.rs::put_staging_object`, and the gRPC entry point
+  stays `scheduler/src/service.rs::put_object`).
 
 **Tests:**
 - Unit:

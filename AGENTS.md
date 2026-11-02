@@ -22,7 +22,7 @@ Raft metadata, bundle aggregation, dual copy / EC, offline-tape workflows, ≥30
 |---|---|---|
 | S3 path-style: bucket CRUD, Put/Get/Head/Delete object, ListObjects **v1**, single `Range`, `If-Match`/`If-None-Match`/`If-(Un)Modified-Since`, `POST ?restore`, `x-amz-restore` | ✅ | `crates/gateway/src/router.rs`, `s3/*.rs`, `protocol.rs` |
 | SigV4 auth, multipart upload, ListObjectsV2, virtual-host style, `x-amz-meta-*`, `aws-chunked` decoding, CopyObject, versioning | ❌ absent (no auth at all: every request is accepted) | — |
-| PUT → cache staging → background archive to tape → `COLD` | ✅ but **1 object = 1 bundle = 1 filemark**, single tape and drive from config | `scheduler/src/service.rs::archive_staging_batch` |
+| PUT → cache staging → background archive to tape → `COLD` | ✅ but **1 object = 1 bundle = 1 filemark**, single tape and drive from config | `scheduler/src/archive.rs::archive_staging_batch` |
 | Bundle aggregation, dual-tape copy, EC | ❌ (`tape_set` field and aggregation config exist, unused) | — |
 | Restore queue: sort tier → tape → offset, SHA-256 verify, write to restored cache with TTL | ✅ | `recall_pending_batch`, `process_recall_task` |
 | Offline-tape notification, operator confirmation API, merge by `archive_id` | ❌ (only `Unavailable` → `WaitingForMedia` → retry next tick) | — |
@@ -203,7 +203,7 @@ Full policy, mounts, cache rules and troubleshooting: **[`docs/BUILD.md`](docs/B
 | `coldstore-proto` | lib | gRPC/protobuf contracts | `proto/{common,metadata,scheduler,cache,tape}.proto`, `build.rs` |
 | `coldstore-common` | lib | config structs and defaults, shared models/errors | `src/config.rs`, `models.rs`, `error.rs` |
 | `coldstore-gateway` | bin+lib | S3 HTTP (axum 0.7) → scheduler gRPC | `router.rs` (route table), `s3/` (one module per operation family: `bucket`, `object`, `list`, `restore`, `range`, `preconditions`, `headers`, `errors`, `xml`), `protocol.rs` (restore XML, error codes), `lib.rs` (`GatewayBackend`, gRPC client) |
-| `coldstore-scheduler` | bin+lib | business core: S3 ops, archive loop, recall loop | `service.rs` (~3.7k lines, ~55% tests), `clients/{cache,tape}.rs` (cache/tape traits + gRPC clients), `leases.rs` (item/task locks, tape lease, `capacity_reject` parsing), `responses.rs` (proto response builders), `util.rs` |
+| `coldstore-scheduler` | bin+lib | business core: S3 ops, archive loop, recall loop | `service.rs` (gRPC surface, the `Phase1SchedulerBackend` trait, background loops), `s3_ops.rs` (bucket/object CRUD, restore, restored-cache read), `archive.rs` (staging hand-off, archive task lifecycle, archive loop), `recall.rs` (recall task lifecycle, tape→cache restore, recall loop), `test_util.rs` (shared `#[cfg(test)]` fixtures), `clients/{cache,tape}.rs` (cache/tape traits + gRPC clients), `leases.rs` (item/task locks, tape lease, `capacity_reject` parsing), `responses.rs` (proto response builders), `util.rs` |
 | `coldstore-metadata` | bin+lib | metadata state and persistence | `state_machine.rs` (**all mutations**), `command.rs`, `service.rs` (gRPC), `raft.rs`, `raft_storage.rs` (RocksDB) |
 | `coldstore-cache` | bin+lib | staging + restored cache | `service.rs` (budgets, eviction, TTL), `hdd.rs`, `backend.rs`, `spdk.rs` |
 | `coldstore-tape` | bin+lib | `TapeService` over the `TapeBackend` trait | `service.rs` (simulator backend), `tests/simulator_service.rs` |
@@ -474,12 +474,13 @@ simulator) → 6 → 7.
 - **Language:**
   - Identifiers, error messages, log messages and new comments: English.
   - Existing Chinese comments/docs stay as they are unless you rewrite that code; don't mass-translate.
-- **File size:** `scheduler/src/service.rs` is still ~3.7k lines. AR-00 step 1 (partial) moved the
-  leaf modules out; step 1 continues with `state.rs`, `config.rs`, `s3_ops/`, `archive/`, `recall/`,
-  `drives/`, `clients/metadata.rs`, `singleton.rs`, and step 2 (the `MetadataApi`/`StagingApi`/`TapeWriterApi`
-  wrappers) has not started. Put new subsystems in new modules
-  (e.g. `scheduler/src/archive.rs`). Move existing code only in a dedicated refactor PR without
-  behavior changes.
+- **File size:** the scheduler crate is split (AR-00): `service.rs` ~0.9k lines, `s3_ops.rs` ~0.9k,
+  `test_util.rs` ~0.7k, `recall.rs` ~0.7k, `archive.rs` ~0.6k — no scheduler file exceeds 1,000
+  lines. AR-00 step 1 still owes `state.rs`, `config.rs`, the `s3_ops/` and `archive/` sub-directory
+  split, the `recall/` split, `drives/`, `clients/metadata.rs` and `singleton.rs` from the plan's layout, and step 2 (the
+  `MetadataApi`/`StagingApi`/`TapeWriterApi` wrappers) has not started. Put new subsystems in new
+  modules (e.g. `scheduler/src/archive.rs`). Move existing code only in a dedicated refactor PR
+  without behavior changes.
 
 ---
 

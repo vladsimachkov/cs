@@ -69,15 +69,26 @@ crates/scheduler/src/
 
 ### AR-00: Modularize the scheduler crate (no behavior change) `[M0]` est. 2–3 d
 
-**Status:** in progress. **Step 1 (partial):** the leaf modules landed — `clients/{mod,cache,tape}.rs`,
-`leases.rs`, `responses.rs`, `util.rs` moved out of `service.rs` (4408 → 3722 lines), and the moved
-`pub` items are re-exported from `service` so consumer paths did not change. Still ahead under step 1:
-`state.rs`, `config.rs`, `s3_ops/`, `archive/`, `recall/`, `drives/`, `clients/metadata.rs`,
-`singleton.rs` from the layout above; step 2 (`MetadataApi`/`StagingApi`/`TapeWriterApi` wrappers)
-has not started. Two deviations to keep: `util.rs` and `responses.rs` are **intentional additions** to
-the layout above (true leaves with no back-references), and the two `build_list_objects_page` tests
-still live in `service.rs`'s test module — they move with `s3_ops/list.rs`, together with the rest of
-`mod tests`.
+**Status:** in progress. **Step 1, acceptance met for the file-size rule; layout not yet final.**
+Two moves landed out of `service.rs`: the leaf modules (`clients/{mod,cache,tape}.rs`,
+`leases.rs`, `responses.rs`, `util.rs`, 4408 → 3722 lines) and then `archive.rs`, `recall.rs`,
+`s3_ops.rs` and `test_util.rs` (3722 → 891). No scheduler file now exceeds 1,000 lines, and the
+28 scheduler tests are the same 28 by name and are unchanged in body. The 12 that moved went with the code
+they cover (2 to `archive.rs`, 2 to `recall.rs`, 8 to `s3_ops.rs`). The other 16 stay in
+`service.rs::tests`: the eleven tests of the gRPC surface that stayed there, and the five
+archive-loop tests (`archive_staging_batch_*`, `scheduler_background_once_*`), which move with the
+`archive/` directory split listed below. Moved `pub` items are re-exported from `service`, so consumer paths did not change.
+
+Still ahead under step 1: `state.rs`, `config.rs`, `drives/`, `clients/metadata.rs`, `singleton.rs`,
+and turning the flat `s3_ops.rs` / `archive.rs` / `recall.rs` files into the directories the layout
+above names (`s3_ops/{put,get,head,delete,list,restore,buckets}.rs`, `archive/{planner,executor,…}.rs`)
+— the plan's layout is a directory tree, what landed is one file per area. Step 2
+(`MetadataApi`/`StagingApi`/`TapeWriterApi` wrappers) has not started; `Phase1ArchiveCache` and
+`TapeArchiveWriter` already are the `StagingApi` and `TapeWriterApi` shapes.
+
+One deviation to keep: `util.rs`, `responses.rs` and `test_util.rs` are **intentional additions** to
+the layout above — true leaves with no back-references, and a shared `#[cfg(test)]` fixture module
+that the per-area test modules all need.
 
 **Steps:**
 1. Move code into the layout above. Tests move with their code.

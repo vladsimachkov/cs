@@ -2,10 +2,15 @@
 // `tonic::Status`, which is large enough to trip `clippy::result_large_err`.
 #![allow(clippy::result_large_err)]
 
+pub(crate) mod archive;
 pub(crate) mod clients;
 pub(crate) mod leases;
+pub(crate) mod recall;
 pub(crate) mod responses;
+pub(crate) mod s3_ops;
 pub mod service;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub(crate) mod util;
 
 use anyhow::{anyhow, Result};
