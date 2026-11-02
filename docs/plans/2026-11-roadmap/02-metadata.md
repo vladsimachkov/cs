@@ -89,7 +89,22 @@ Implementations:
    index continuity, start serving.
 7. **Remove the stray snapshot-file path** (`node-N-snapshot.bin`). Keep a one-time import: if the file
    exists and RocksDB is empty, import it and rename the file to `.migrated`.
-8. **Idempotency table:** `request_id → result`, with LRU by count (1 M) persisted in snapshots. A retried
+8. **Migrate the legacy log — this is not optional.** Today `raft_storage.rs:59` writes
+   `format!("{command:?}")`, which cannot be decoded back into a `MetadataCommand`. Any node that
+   upgrades with entries already in `raft:log:*` therefore hits undecodable records on its first
+   replay, and there is no old encoding to write a parser for. Choose one behavior explicitly and test
+   it:
+   - **refuse** (default): on startup, if a log entry above `snapshot_index` fails to decode, do not
+     serve; log the offending index and require an operator action (`coldstore-metadata migrate-log`,
+     which snapshots the current in-memory state, records `snapshot_index`, and truncates the legacy
+     range). Refusing is safe because the state in memory was already applied — the log is only a
+     replay source.
+   - **truncate**: decode forward from `snapshot_index`, stop at the first undecodable entry, truncate
+     everything above it and log how many entries were dropped. Only acceptable if the dropped entries
+     were provably applied to the snapshot (they were: the service applies before persisting).
+   Whichever is chosen, the snapshot layout itself does **not** change, so `SNAPSHOT_MAGIC` stays
+   `COLDMETA2` (§6.7): the log encoding and the snapshot encoding are independent.
+9. **Idempotency table:** `request_id → result`, with LRU by count (1 M) persisted in snapshots. A retried
    command returns the stored result (needed by MD-08).
 
 **Files:** `command.rs`, `raft_storage.rs` (rename to `local_log.rs`), `raft.rs` (→ `consensus/`),
@@ -100,6 +115,9 @@ Implementations:
 - Restart after N writes reproduces the state (compare an encoded snapshot).
 - Crash injection: a `fail_after_log_append` hook, then restart → command applied exactly once.
 - An invalid command leaves no log entry.
+- **Legacy log:** a fixture with `raft:log:*` entries written in the old `Debug` format makes startup
+  take the chosen path (refuse → error naming the index; truncate → drops exactly the legacy range and
+  serves), and a node with an empty log is unaffected.
 - 100 k writes complete in < 30 s on CI (`--release`, ignored by default, run nightly).
 - Snapshot + truncation keep the log bounded.
 

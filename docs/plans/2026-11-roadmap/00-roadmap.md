@@ -30,20 +30,55 @@ tape-backed cold archive with restore, cache, offline-tape workflows, data prote
 
 Each milestone has a hard exit criterion. A milestone is **done only when its exit test runs
 automatically** — in CI, or, while GitHub Actions are disabled in this repository (per the maintainer,
-2026-11: no quota), in the
-container gate (`scripts/docker.sh check-safe`). The mhVTL lab job applies for M2 either way. A test
-that only someone remembers to run does not close a milestone.
+2026-11: no quota), in the container gate (`scripts/docker.sh check-safe`). The mhVTL lab job applies
+for M2 either way. A test that only someone remembers to run does not close a milestone.
 
-### M0: Trustworthy single node (≈ 6–8 engineer-weeks)
+### Estimate reality (measured against the task list, 2026-11)
+
+The week figures in each milestone heading are **elapsed calendar weeks for a small team**, not the
+sum of the task estimates. Summing every `est.` in the nine plan files gives a different number:
+
+| Milestone | Tasks | Sum of task estimates | Solo engineer | Heading claims | Optimism |
+|---|---|---|---|---|---|
+| M0 | 26 | 73–94 eng-days | ≈17 wk | 6–8 wk | **2.4×** |
+| M1 | 28 | 108–132 eng-days | ≈24 wk | 8–10 wk | **2.7×** |
+| M2 | 8 | 37–45 eng-days | ≈8 wk | 8–12 wk | 0.8× (has slack) |
+| M3 | 9 | 31–38 eng-days | ≈7 wk | 5–7 wk | 1.2× |
+| M4 | 18 | 82–102 eng-days | ≈18 wk | 10–14 wk | 1.5× |
+| M5 | 9 | 46–57 eng-days | ≈10 wk | 10–14 wk | 0.9× (has slack) |
+| M6 | 8 | 38–51 eng-days | ≈9 wk | 6–10 wk | 1.1× |
+
+Readings: M0 and M1 are the two milestones whose headings cannot be met by one or two engineers —
+they need three or four in parallel, and M0's critical path (`MD-04 → CA-01 → GW-01`,
+`MD-01 → MD-06 → AR-01`) only supports about two people inside `coldstore-metadata` at a time. M2
+and M5 are estimated honestly (M2 is hardware-bound anyway). Tasks tagged for two milestones are
+counted in both, which inflates M1 and M6 slightly. `TP-12`, `DP-06` and `PL-10` carry open-ended
+estimates and are excluded.
+
+When planning a person-month, use the eng-day sums, not the headings.
+
+Note on tags: the task headers in the nine plan files still say `[M0]`. That is correct for both
+stages — the plan files do not distinguish M0-a from M0-b; this file is the only place that assigns a
+task to a stage, and its scope tables are authoritative.
+
+### M0: Trustworthy single node (≈ 6–8 engineer-weeks with 3 engineers; ≈ 17 solo)
 
 **Theme:** no data loss, correct semantics, usable for objects up to 5 GiB on one machine with the
 simulated library.
+
+M0 is split into two stages with their own exit tests. As one milestone it was a single monolithic
+gate: nothing could be proven end-to-end until every one of its P0 tasks had landed, because the only
+exit test needed streaming, a persistent tape, generations, leases and the restore lifecycle at once.
+M0-a delivers the data-integrity guarantees with the existing buffered request path; M0-b raises the
+size ceiling and removes the buffering.
+
+#### M0-a: Integrity and semantics (buffered bodies)
 
 **Scope:**
 
 | Area | Tasks |
 |---|---|
-| Gateway | GW-00, GW-01, GW-02, GW-03, GW-09, GW-11, GW-12, GW-14a |
+| Gateway | GW-00, GW-09, GW-11, GW-12, GW-14a |
 | Metadata | MD-01, MD-04, MD-05, MD-06 |
 | Archive | AR-00, AR-01 |
 | Recall | RC-01, RC-02, RC-10 |
@@ -51,14 +86,37 @@ simulated library.
 | Tape | TP-01 |
 | Platform | PL-01, PL-02a, PL-04, PL-06a (e2e job) |
 
-**Exit test** (`scripts/e2e/m0.sh`, run in CI):
-1. Upload 1 KiB, 3 MiB, 300 MiB and 5 GiB objects (streamed).
+**Exit test** (`scripts/e2e/m0a.sh`, run by the gate):
+1. Upload 1 KiB, 3 MiB and 128 MiB objects.
 2. Overwrite one of them and delete one.
 3. Wait for archive, then `kill -9` every process.
 4. Restart and restore all objects; verify bytes and ETag.
 5. Let one restore expire, restore it again, verify.
 
-No step may leave an object stuck in a non-terminal state.
+**Known interim limit:** bodies are still buffered in memory, so `DefaultBodyLimit` is raised from
+axum's 2 MiB default to 128 MiB as an explicit, documented ceiling — peak gateway memory is
+`concurrent PUTs × 128 MiB`. M0-b replaces this with streaming; do not treat 128 MiB as safe for
+larger values.
+
+Why the cache tasks are here and not in M0-b: `CA-02` (durable staging) is what makes the `kill -9`
+step meaningful — without it an acknowledged PUT is lost, which is the defect M0 exists to close —
+and `CA-01` keys staging by `object_id`, which `AR-01` depends on. `CA-01` lands with its streaming
+methods and its own tests; the gateway starts calling them in M0-b.
+
+#### M0-b: Streaming and the size ceiling
+
+**Scope:**
+
+| Area | Tasks |
+|---|---|
+| Gateway | GW-01, GW-02, GW-03 |
+
+**Exit test** (`scripts/e2e/m0b.sh`): the M0-a test re-run with 300 MiB and 5 GiB objects streamed,
+plus: gateway RSS stays under `chunk_size × concurrent_requests` (no whole-object `Vec<u8>`), and a
+`Range` GET is served without reading the whole object. The cache already streams (CA-01); this stage
+is the gateway adopting it and dropping the buffered path.
+
+No step of either stage may leave an object stuck in a non-terminal state.
 
 ### M1: Tape-efficient archive and recall (≈ 8–10 engineer-weeks)
 
@@ -148,16 +206,19 @@ access more than on code.
 
 ```mermaid
 graph LR
-  subgraph M0
+  subgraph M0a
     MD01[MD-01 real log] --> MD06[MD-06 leases/versions]
     MD04[MD-04 object generations] --> AR01[AR-01 archive fixes]
     MD05[MD-05 restore lifecycle] --> RC01[RC-01 restore fixes]
     MD06 --> AR01
     MD06 --> RC02[RC-02 recall leases]
     TP01[TP-01 file-backed simulator] --> AR01
-    CA01[CA-01 streaming cache] --> GW01[GW-01 streaming PUT]
-    CA02[CA-02 durable staging] --> GW01
+    MD04 --> CA01[CA-01 streaming cache, keyed by object_id]
+    CA02[CA-02 durable staging] --> AR01
     PL01[PL-01 config loading]
+  end
+  subgraph M0b
+    CA01 --> GW01[GW-01 streaming PUT]
   end
   subgraph M1
     TP02[TP-02 backend trait v2] --> AR04[AR-04 tape format v1]
@@ -186,6 +247,23 @@ graph LR
   end
 ```
 
+## Suggested execution order for M0
+
+Two tracks, because `coldstore-metadata` and `coldstore-tape`/`coldstore-gateway` barely overlap and
+can proceed in parallel; with one engineer, take them top to bottom.
+
+| Step | Metadata track | Tape / gateway track |
+|---|---|---|
+| 1 | `MD-04` object generations (unblocks CA-01 and AR-01) | `GW-00` + `AR-00` — pure refactors, no behavior change, cheap, and every later task touches these files |
+| 2 | `MD-01` replayable log (same crate, so after MD-04) | `TP-01` file-backed simulator (defect #3) |
+| 3 | `MD-06` leases and versions → `AR-01` archive fixes | `MD-05` + `RC-01` restore lifecycle, `CA-01`/`CA-02` cache side |
+| 4 | `RC-02`, `RC-10`, `CA-03`, `PL-01`, `PL-02a`, `PL-04` | `GW-09`, `GW-11`, `GW-12`, `GW-14a`, then `scripts/e2e/m0a.sh` closes M0-a |
+| 5 | — | `GW-01` → `GW-02` → `GW-03`, then `scripts/e2e/m0b.sh` closes M0-b |
+
+`MD-04` is the riskiest item in M0: it changes proto and the snapshot payload, so it falls under
+`AGENTS.md` §6.7–6.8 and needs the compatibility story (new field tags only, no renumbering) in its
+own PR. Do not bundle it with `MD-01`.
+
 ## Cross-cutting decisions (apply to every plan)
 
 | # | Decision | Rationale |
@@ -213,7 +291,8 @@ graph LR
 
 ## Global task checklist
 
-- [ ] M0: GW-00 GW-01 GW-02 GW-03 GW-09 GW-11 GW-12 GW-14a · MD-01 MD-04 MD-05 MD-06 · AR-00 AR-01 · RC-01 RC-02 RC-10 · CA-01 CA-02 CA-03 CA-10a · TP-01 · PL-01 PL-02a PL-04 PL-06a
+- [ ] M0-a: GW-00 GW-09 GW-11 GW-12 GW-14a · MD-01 MD-04 MD-05 MD-06 · AR-00 AR-01 · RC-01 RC-02 RC-10 · CA-01 CA-02 CA-03 CA-10a · TP-01 · PL-01 PL-02a PL-04 PL-06a
+- [ ] M0-b: GW-01 GW-02 GW-03
 - [ ] M1: AR-02…AR-08 AR-10 AR-11 · RC-03 RC-04 RC-05a RC-06 RC-07 RC-09 · TP-02 TP-08a (mhVTL) · MD-03 MD-10 · CA-04a CA-06 CA-09 · GW-04 GW-08 GW-13a · PL-06b PL-08
 - [ ] M2: TP-03…TP-06 TP-08b TP-09 · AR-09 (hardware) · RC-08
 - [ ] M3: OP-01…OP-06 OP-08 · RC-05b RC-11
