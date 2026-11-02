@@ -203,7 +203,7 @@ Full policy, mounts, cache rules and troubleshooting: **[`docs/BUILD.md`](docs/B
 | `coldstore-proto` | lib | gRPC/protobuf contracts | `proto/{common,metadata,scheduler,cache,tape}.proto`, `build.rs` |
 | `coldstore-common` | lib | config structs and defaults, shared models/errors | `src/config.rs`, `models.rs`, `error.rs` |
 | `coldstore-gateway` | bin+lib | S3 HTTP (axum 0.7) → scheduler gRPC | `router.rs` (route table), `s3/` (one module per operation family: `bucket`, `object`, `list`, `restore`, `range`, `preconditions`, `headers`, `errors`, `xml`), `protocol.rs` (restore XML, error codes), `lib.rs` (`GatewayBackend`, gRPC client) |
-| `coldstore-scheduler` | bin+lib | business core: S3 ops, archive loop, recall loop | `service.rs` (~4.4k lines, ~45% tests) |
+| `coldstore-scheduler` | bin+lib | business core: S3 ops, archive loop, recall loop | `service.rs` (~3.7k lines, ~55% tests), `clients/{cache,tape}.rs` (cache/tape traits + gRPC clients), `leases.rs` (item/task locks, tape lease, `capacity_reject` parsing), `responses.rs` (proto response builders), `util.rs` |
 | `coldstore-metadata` | bin+lib | metadata state and persistence | `state_machine.rs` (**all mutations**), `command.rs`, `service.rs` (gRPC), `raft.rs`, `raft_storage.rs` (RocksDB) |
 | `coldstore-cache` | bin+lib | staging + restored cache | `service.rs` (budgets, eviction, TTL), `hdd.rs`, `backend.rs`, `spdk.rs` |
 | `coldstore-tape` | bin+lib | `TapeService` over the `TapeBackend` trait | `service.rs` (simulator backend), `tests/simulator_service.rs` |
@@ -428,6 +428,7 @@ Treat these as facts when designing changes. Fixing one requires a regression te
 | 8 | Single tape and drive from config; tape full → every later archive task fails. The next filemark is tracked per drive, not per tape | code | `archive_staging_once`, `SimulatorState` |
 | 9 | Config fields declared but never read: `min/max_archive_size_mb`, `target_throughput_mbps`, `aggregation_window_secs`, `write_buffer_mb`, `merge_window_secs`, `restore_timeout_secs`, `read_buffer_mb`, `tape_hold_secs` | grep | `common/src/config.rs` |
 | 10 | Standalone binaries ignore config files; worker register/heartbeat RPCs exist but no worker calls them | code | `*/src/main.rs`, `metadata.proto` |
+| 11 | **Cache unit tests can share a temp dir and collide.** `test_config()` names `/tmp/coldstore-cache-test-<n>` from `SystemTime::now().as_nanos()`, which is not unique under concurrency. Two services then share one `meta/`: `discover_next_id` hands out duplicate ids, and a sibling's `delete()` removes the shared `meta/<id>.json`, so the next `delete()`/`read()` on that id fails in `read_xattrs` with ENOENT (its own `remove_file` calls ignore errors). Observed once (`restored_eviction_prefers_lfu`, "restore b: No such file or directory"), with three clean 116/116 reruns. Violates §9 (unique temp dirs); `uuid` is already a cache dependency, so the fix is one line | test run + code | `cache/src/service.rs` `test_config`, `cache/src/hdd.rs` `discover_next_id`, `delete` |
 
 Breakdown of #6:
 - Log entries are stored as `format!("{command:?}")`, which cannot be replayed.
@@ -473,7 +474,10 @@ simulator) → 6 → 7.
 - **Language:**
   - Identifiers, error messages, log messages and new comments: English.
   - Existing Chinese comments/docs stay as they are unless you rewrite that code; don't mass-translate.
-- **File size:** `scheduler/src/service.rs` is already ~4.4k lines. Put new subsystems in new modules
+- **File size:** `scheduler/src/service.rs` is still ~3.7k lines. AR-00 step 1 (partial) moved the
+  leaf modules out; step 1 continues with `state.rs`, `config.rs`, `s3_ops/`, `archive/`, `recall/`,
+  `drives/`, `clients/metadata.rs`, `singleton.rs`, and step 2 (the `MetadataApi`/`StagingApi`/`TapeWriterApi`
+  wrappers) has not started. Put new subsystems in new modules
   (e.g. `scheduler/src/archive.rs`). Move existing code only in a dedicated refactor PR without
   behavior changes.
 

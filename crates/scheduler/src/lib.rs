@@ -2,7 +2,11 @@
 // `tonic::Status`, which is large enough to trip `clippy::result_large_err`.
 #![allow(clippy::result_large_err)]
 
+pub(crate) mod clients;
+pub(crate) mod leases;
+pub(crate) mod responses;
 pub mod service;
+pub(crate) mod util;
 
 use anyhow::{anyhow, Result};
 use coldstore_common::config::SchedulerConfig;

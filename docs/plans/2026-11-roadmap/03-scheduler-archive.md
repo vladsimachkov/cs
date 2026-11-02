@@ -34,7 +34,7 @@
 - Config fields `min/max_archive_size_mb`, `aggregation_window_secs`, `write_buffer_mb` and
   `target_throughput_mbps` are unused.
 - Tape full → every later task fails.
-- `scheduler/src/service.rs` is 4.4 k lines and mixes S3 ops, archive, recall and tests.
+- `scheduler/src/service.rs` is 4.4 k lines (pre-AR-00; see the AR-00 status below) and mixes S3 ops, archive, recall and tests.
 
 ## Target architecture
 
@@ -68,6 +68,16 @@ crates/scheduler/src/
 ## Tasks
 
 ### AR-00: Modularize the scheduler crate (no behavior change) `[M0]` est. 2–3 d
+
+**Status:** in progress. **Step 1 (partial):** the leaf modules landed — `clients/{mod,cache,tape}.rs`,
+`leases.rs`, `responses.rs`, `util.rs` moved out of `service.rs` (4408 → 3722 lines), and the moved
+`pub` items are re-exported from `service` so consumer paths did not change. Still ahead under step 1:
+`state.rs`, `config.rs`, `s3_ops/`, `archive/`, `recall/`, `drives/`, `clients/metadata.rs`,
+`singleton.rs` from the layout above; step 2 (`MetadataApi`/`StagingApi`/`TapeWriterApi` wrappers)
+has not started. Two deviations to keep: `util.rs` and `responses.rs` are **intentional additions** to
+the layout above (true leaves with no back-references), and the two `build_list_objects_page` tests
+still live in `service.rs`'s test module — they move with `s3_ops/list.rs`, together with the rest of
+`mod tests`.
 
 **Steps:**
 1. Move code into the layout above. Tests move with their code.
